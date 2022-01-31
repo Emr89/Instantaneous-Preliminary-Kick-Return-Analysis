@@ -1,0 +1,2491 @@
+---
+title: "Kick_Return_Analysis"
+author: "Eric Rupinski"
+date: "1/6/2022"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r}
+
+#Read in libraries:
+library(here)
+library(ggplot2)
+library(gganimate)
+library(udpipe)
+library(randomForest)
+library(tidyverse)
+library(lme4)
+library(factoextra)
+library(moments)
+library(forecast)
+library(fastDummies)
+library(NeuralNetTools)
+library(caret)
+library(CAST)
+library(parallel)
+library(doMC)
+
+#Multicore processing
+numCores <- detectCores()
+registerDoMC(cores = numCores)
+
+
+#Read all files into this RMD file:
+df_tracking_1 <- read_csv(here("tracking2018.csv"))
+df_tracking_2 <-read_csv(here("tracking2019.csv"))
+df_tracking_3 <-read_csv(here("tracking2020.csv"))
+df_plays <- read_csv(here("plays.csv"))
+df_PFFScouting <-  read_csv(here("PFFScoutingData.csv"))
+df_games <- read.csv(here("games.csv"))
+
+#Combining tracking data sets:-
+df_t <- rbind(df_tracking_2,df_tracking_3)
+
+#Standardizing tracking data so its always in direction of kicking team.
+df_tracking <- df_t %>%
+                mutate(x = ifelse(playDirection == "left", 120-x, x),
+                       y = ifelse(playDirection == "left", 160/3 - y, y))
+```
+
+```{r}
+#First Data set attempt was at Euclidean distances from every player ranked by distance from the KR and team was One-Hot Encoded
+
+#creating data frame that will only includes Kick Returns that were actually returned. 
+df_first_ko <- df_tracking %>%
+    #joining the scouting data
+    left_join(df_plays, by = c("gameId", "playId")) %>%
+    #filtering for kickoff plays only
+    filter(specialTeamsPlayType == "Kickoff") %>%
+  #filtering for only kicks that were returned
+  filter(kickReturnYardage != "NA") %>%
+  #Subsetting desireable variables
+  select(., time:playDirection, possessionTeam:kickBlockerId,kickReturnYardage)
+
+#Creating a new variable where I change a categorical level of the position variable to differentiate the kick returner from the rest (The "A" prefix was added to be able to run code later that matches the positioning of the variable)
+df_first_ko_1 <- df_first_ko %>% group_by(gameId,playId,frameId) %>%  mutate(a_pos = replace(position,nflId==returnerId,"AKR"))
+
+#Setting aside this separate data set for a later step
+df_Kickoffs_A <- df_first_ko_1 %>% select(., -time,-(nflId:team),-(gameId:a_pos)) %>% filter(.,event=="tackle")
+
+#Arranging the data by the new position variable, so kick returner is at the top 
+df_first_ko_2 <- df_first_ko_1 %>% arrange(.,a_pos) %>% 
+  #Then grouping by each unique frame in each unique play
+  group_by(gameId,playId,frameId) %>%
+  #Then creating the distance that each player/observation is from the Kick Returner
+   mutate(Euclidean = as.matrix(dist(cbind(x, y)))[1, ]) %>%
+  #ungrouping the data
+  ungroup()
+
+#Data set for later
+ df_ko_rf_a <- df_first_ko_2
+
+#Grouping the data again by each unqiue frame
+df_first_ko_3 <- df_first_ko_2 %>% group_by(gameId,playId,frameId) %>%
+  #Creating a unique ID for every other player in each frame (including football =23)
+  mutate(UniPlayInd = row_number()) %>%
+  ungroup()
+
+#Matching each unique distance to its unique frameId and relative player relationship
+TestEuc<- df_first_ko_3 %>% pivot_wider(.,id_cols = c(gameId,playId,frameId,UniPlayInd), names_from = UniPlayInd, names_prefix = "Euc", values_from = Euclidean)
+
+#Converting Home/Away to Binary
+  #Might need to change method of encoding teams
+df_first_ko_3$HomeTrue <- df_first_ko_3$team == "home"
+df_first_ko_3$HomeTrue <- as.integer(df_first_ko_3$HomeTrue)
+
+#Home/away Hot encode
+Home_Away_Table <- df_first_ko_3 %>% pivot_wider(.,id_cols = c(gameId,playId,frameId,UniPlayInd), names_from = UniPlayInd, names_prefix = "Home", values_from = HomeTrue)
+
+#Combining tables 
+ df_first_ko_4 <- df_first_ko_3 %>% left_join(.,TestEuc, by = c("gameId","playId","frameId")) %>% left_join(.,Home_Away_Table, by = c("gameId","playId","frameId"))
+ 
+
+ # Converting None to NA for events in Kickoff Data set
+df_first_ko_4$event<- recode_factor(df_first_ko_4$event, None = NA_character_)
+df_first_ko_4$event<- recode_factor(df_first_ko_4$event, kickoff = NA_character_)
+ 
+
+# Filtering out all other observation besides Kick Returners
+ df_first_ko_5 <- df_first_ko_4 %>% filter(., a_pos == "AKR") %>%
+ 
+ #Cleaning up unnessecary columns:
+ select(., -time, -(displayName:team),- (playDirection:specialTeamsResult),-(returnerId:kickBlockerId), -(a_pos:Euc1)) %>% 
+   #Filtering to only have the moment the KR catches the ball.
+   filter(., event =="kick_received") 
+ 
+ #Random Forest Model to show importance of predictors 
+ 
+ #Tuning the mtry value for random forest
+ mtry <- tuneRF(df_first_ko_5[-14],df_first_ko_5$kickReturnYardage, ntreeTry=1000,
+               stepFactor=1.5,improve=0.01, trace=TRUE, plot=TRUE)
+best.m <- mtry[mtry[, 2] == min(mtry[, 2]), 1]
+print(mtry)
+print(best.m)
+
+#A function that creates a variable importance score
+I_SCORE_FUNC <- function(RF_TEST){
+i_scores <- varImp(RF_TEST ,conditional=TRUE)
+#Gathering rownames in 'var'  and converting it to the factor
+#to provide 'fill' parameter for the bar chart. 
+i_scores <- i_scores %>% tibble::rownames_to_column("var") 
+i_scores$var<- i_scores$var %>% as.factor()
+#Plotting the bar and polar charts for comparing variables
+i_bar <- ggplot(data = i_scores) + 
+  geom_bar(
+    stat = "identity",#it leaves the data without count and bin
+    mapping = aes(x = var, y=Overall, fill = var), 
+    show.legend = FALSE,
+    width = 1
+  ) + 
+  labs(x = NULL, y = NULL)
+i_bar + coord_polar() + theme_minimal()
+i_bar + coord_flip() + theme_minimal()
+}
+
+ #Random Forest Model
+ DS1_RF1 <- randomForest(kickReturnYardage ~. -event -nflId -frameId-gameId-playId-kickerId, mtry=best.m,importance = TRUE, ntree=1000, data = df_first_ko_5)
+
+#Variable importance charts
+I_SCORE_FUNC(DS1_RF1)
+ 
+```
+
+```{r}
+#Setting up second data set t
+
+#setting up team specific data sets
+DS_KO_2 <- df_ko_rf_a %>% 
+  
+  #Join with games data set
+  inner_join(df_games)  %>% 
+  
+  #Put specific team names for each player based off home/away
+  mutate(Teams = ifelse(team=="home",homeTeamAbbr,visitorTeamAbbr)) %>% 
+  
+  #Creating variable to show what team is recieving the the ball during the KO
+  mutate(RecTeam = if_else(possessionTeam==Teams,"Kick","Rec")) %>% 
+  
+  #filter for only observations with the kicking team AND the KR
+  filter(.,RecTeam == "Kick" | a_pos == "AKR") %>% 
+  
+  #Arrange by Euclidean
+  arrange(.,Euclidean)  %>% 
+  
+  #Delete the football from the observations 
+  filter(., displayName != "football") %>% 
+  
+  #Subset every play to the moment the KR receives the ball
+  filter(., event =="kick_received") %>%
+  
+  #Select Variables of Importance
+  select(., -time,-event,-(displayName:team),-(playDirection:kickBlockerId),-(season:Teams)) %>%
+  
+  #Group by gameId and playId
+  group_by(gameId,playId) %>% 
+  
+  #Create a Unique Identifier for players on the kicking team (and KR)
+  mutate(UniPlayInd = row_number()) %>% filter(., UniPlayInd < 13 )
+
+#Create dummy tables 
+
+#Euclidean Table
+XB <- DS_KO_2 %>% pivot_wider(.,id_cols = c(gameId,playId), names_from = UniPlayInd  , names_prefix = "Euc", values_from = Euclidean)
+
+#Speed Table
+XC <- DS_KO_2 %>% pivot_wider(.,id_cols = c(gameId,playId), names_from = UniPlayInd  , names_prefix = "Speed", values_from = s)
+
+#Acceleration Table
+XD <- DS_KO_2 %>% pivot_wider(.,id_cols = c(gameId,playId), names_from = UniPlayInd  , names_prefix = "Acc", values_from = a)
+ 
+#Orientation Table
+XE <- DS_KO_2 %>% pivot_wider(.,id_cols = c(gameId,playId), names_from = UniPlayInd  , names_prefix = "Ori", values_from = o)
+
+#Subsetting main data to only have the observation focused on the KR
+XA <- subset(DS_KO_2, a_pos == "AKR")
+
+#Creating Full Team Data (FT)
+FT <- XA %>% 
+  
+  #left join all the dummy tables 
+  left_join(XB) %>% left_join(XC) %>% left_join(XD) %>% left_join(XE) %>% 
+  
+  #Join with PFF scouting data set
+  left_join(df_PFFScouting) %>% 
+  
+  #Select only variables of interest 
+  select(., -(nflId:playId),-(a_pos:Euc1),-Speed1,-Acc1,-Ori1,-(snapDetail:operationTime),-(kickDirectionIntended:kickDirectionActual),-(missedTackler:tackler),-(gunners:kickContactType)) %>% 
+  
+  #Filter out missing values of hangtime and observations with no KR yards
+  filter(., hangTime != "NA") %>% filter(.,kickReturnYardage != "NA")
+
+#Delete all NAs from the Data set
+FT<- na.exclude(FT)
+
+
+#Random Forest Model 
+  #Tuning mtry
+mtry <- tuneRF(FT[-10],FT$kickReturnYardage, ntreeTry=1000, stepFactor=1.5,improve=0.01, trace=TRUE, plot=TRUE)
+best.m <- mtry[mtry[, 2] == min(mtry[, 2]), 1]
+
+#Creating Random Forest Model
+ DS1_RF2 <- randomForest(kickReturnYardage ~. -gameId-playId, mtry=best.m,importance = TRUE, ntree=1000, data = FT)
+ 
+ #Variable Importance Scores
+ I_SCORE_FUNC(DS1_RF2)
+```
+
+
+```{r}
+#creating data frame that will only includes Kick Returns that were actually returned. 
+df_K <- df_tracking %>%
+  
+    #joining the scouting data
+    left_join(df_plays, by = c("gameId", "playId")) %>%
+  
+    #filtering for kickoff plays only
+    filter(specialTeamsPlayType == "Kickoff") %>%
+  
+  #filtering for only kicks that were returned
+  filter(kickReturnYardage != "NA") %>%
+  
+  #Subsetting desireable variables
+  select(., time:playDirection, possessionTeam:kickBlockerId,kickReturnYardage) %>% 
+  
+  #Creating Unique Indefintifer based off nflId, gameId, and playId
+  mutate(UKI = unique_identifier(., fields = c("nflId", "gameId","playId"))) %>% 
+  
+  #Create Unique Identifier for each unique play across all games and seasons
+  mutate(UPI = unique_identifier(., fields = c("gameId","playId"))) %>%
+  
+  #Joining with PFF scouting data table
+  left_join(df_PFFScouting) %>%
+  
+  #joining data with games data set
+  inner_join(df_games)  %>% 
+
+  #Sorting teams by home and away for each game into one column
+  mutate(Teams = ifelse(team=="home",homeTeamAbbr,visitorTeamAbbr)) %>% 
+  
+  #Sorting by which team is the Kicking and Receiving team for each game 
+  mutate(RecTeam = if_else(possessionTeam==Teams,"Kick","Rec")) %>% 
+
+  #Creating a new variable where I change a categorical level of the position variable to differentiate the kick returner from the rest (The "A" prefix was added to be able to run code later that matches the positioning of the variable)
+  group_by(UPI,frameId) %>%  mutate(a_pos = replace(position,nflId==returnerId,"AKR"))
+
+#Head of df_K
+head(df_K)
+
+
+#Arranging the data by the new position variable, so kick returner is at the top 
+df_KOP <- df_K %>% arrange(.,a_pos) %>% 
+  
+  #Subsetting the data to the moment the Kick Returner receives the kick
+ filter(., event == "kickoff")   %>% 
+  
+  #Subset to only include the Kicking Team
+  filter(.,RecTeam == "Kick") %>% 
+  
+  #Creating categorical variable to differentiate between Kicker and non-kicker
+  mutate(KickerYN = ifelse(nflId==kickerId,"A","B")) %>% 
+  
+  #Cleaning up errors in the data to ensure only players in KickerYN level A , is a kicker
+  filter(., returnerId != "NA") %>%
+  
+  #Arrange with the kickers at the top
+  arrange(., KickerYN) %>% 
+  
+  #Reset group and filter at the point of the kickoff and subset by each unique play 
+   group_by(UPI) %>% 
+  
+  #Creating a variable to find the distance from the kicker
+  mutate(DistKick = y - first(y)) %>%  
+  
+  #ungrouping the data and filter to delete the football out of the data 
+  ungroup () %>% filter(., displayName != "football") %>%
+  
+  #Arrange by the Distance Kick
+  arrange(DistKick) %>% 
+  
+  #Group by each play each unique play 
+  group_by(UPI)  %>%  
+  
+  #Ranking by each distance for each play to determine the position from the kicker, setting up KOP (KOP = Kickoff position)
+  mutate(KOP = rank(DistKick)) %>% 
+  
+  #Recoding the factors to match the position on the kickoff 
+  mutate(KOP = as.factor(KOP), KOP = fct_recode(KOP, "L1" ="1", "L2"="2","L3"="3","L4"="4","L5"="5", "K"="6","R5"="7","R4"="8","R3"="9","R2"="10","R1"="11")) 
+
+#Selecting the unique identifier and the Kickoff Position, and ungrouping the data
+df_KOP <- df_KOP %>% select(., UKI, KOP)  %>% ungroup()
+
+#head df_KOP
+head(df_KOP)
+
+#Create data set for later use 
+df_FDS <- df_KOP
+
+#Setting up main kickoff tracking dataset 
+# Creating Inital Kickoff Tracking (KOT_I) by joining main tracking and Kickoff Position by unique identifier 
+
+#AKR_S <- df_K %>% filter(a_pos == "AKR") %>% filter(., event == "tackle") %>% mutate(KR_X = x) %>% select(.,gameId, playId, frameId, KR_X ) %>% ungroup()
+
+df_KOT_I <- df_K %>% left_join(df_KOP, by = "UKI") %>% 
+  
+  #Filter by the moment the kick was receieved by the kick returner
+  filter(., event == "kick_received") 
+
+#Converting kickoff position to character and replacing NAs with 0s
+df_KOT_I$KOP <- df_KOT_I$KOP %>% as.character() %>% replace_na(0)
+
+#head df_KOT_I
+head(df_KOT_I)
+
+#Creating Main Kickoff tracking data set 
+df_KOT<- df_KOT_I %>% 
+  
+  #Mutating Kickoff Position to add unique level of Kick Returner
+  mutate(KOP = replace(KOP,nflId==returnerId,"KR")) %>%
+  
+  #Filtering out the football from the tracking data and arrange by position 
+  filter(., displayName != "football") %>% arrange(.,a_pos) %>% 
+  
+  #Renaming the key variables that were altered by the table join
+  rename(.,UPI = UPI.x ) %>% 
+  
+  #Then grouping by each unique frame in each unique play
+  group_by(UPI) %>%
+  
+  #Then creating the distance that each player/observation is from the Kick Returner and ungroup
+  mutate(Euclidean = as.matrix(dist(cbind(x, y)))[1, ]) %>% ungroup()
+
+#head of df_KOT
+head(df_KOT)
+
+#Creating cleaning data set to fill in Missing Kick returner position values by proximity to KR
+df_clean <- df_KOT %>%
+  
+  #Filtering for absent Position values
+  filter(., KOP == "0") %>% 
+  
+  #Selecting only variables needed to fill KOP values 
+  select(., x:dir,nflId,frameId:playDirection,kickReturnYardage:a_pos,KOP:Euclidean) %>%
+  
+  #Arrange by the Euclidean values 
+  arrange(Euclidean) %>% 
+  
+  #Group by each play each unique play 
+  group_by(UPI) %>% 
+  
+  #Ranking by each distance for each play to determine the position from the KR
+  mutate(KOP = rank(Euclidean)) %>%
+  
+  #Filtering out plays where data had a typo and didn't follow previous code
+  filter(., KOP < 11) %>% filter(., Euclidean > 0.0) %>%
+  
+  #Selecting Kick Return Euclidean Position and unique Identifier
+  select(., UKI, KOP)
+
+ #print df_clean
+ head(df_clean)
+
+#Creating Merge data set to combine all values of Kickoff Position into one column 
+df_KRKO <- df_KOT %>% left_join(df_clean, by="UKI")%>% 
+  
+  #Identifying NAs in original KOP column to show where df_clean$KOP values will go
+  mutate(KOP.x = replace(KOP.x, KOP.x==0, NA)) %>% 
+  
+  #Defining new Total KOP (TKOP), that uses both KOP columns to create the complete column
+  transform(., TKOP = ifelse(!is.na(KOP.x), KOP.x, KOP.y)) %>%
+  
+  #Selecting variables of interest
+  select(., x:dir,frameId:playDirection,kickReturnYardage:UPI.x,hangTime:kickoffReturnFormation, Teams:a_pos,Euclidean,TKOP) %>% 
+  
+  #Filter out any plays where TKOP could not be identified
+  filter(., TKOP != "NA") %>% 
+  
+  #Rename variables that were altered by the table join
+  rename(.,UPI = UPI.x )%>%
+  
+  #Arranging the data set by Euclidean Distances
+  arrange(RecTeam,Euclidean) %>%
+  
+  #Grouping by 
+  group_by(UPI) %>% 
+  
+  #Creating Unique Ident variable for only the Kicking team based on Euclidean Position from the KR 
+  mutate(UNI_KICK = row_number()) %>% 
+  
+  #Getting rid of play that didn't sort correctly 
+  filter(.,UNI_KICK < 23) %>% ungroup() %>%
+  
+  #Group by unique play id, and filtering the lower bound to make sure every play has exactly 22 obs.
+  group_by(UPI) %>% filter(n()>20) %>%
+  
+  #arrange by UNI_KICK
+  arrange(UNI_KICK) %>%
+
+  #Creating Total Euclidean for Kick Team
+  mutate(KTE = sum(Euclidean[UNI_KICK[c(1:11)]]))  %>% 
+  
+  #Creating Total Euclidean for Kick Team (First 2 closest players, EXCLUDING KR)
+  mutate(KTC2 = sum(Euclidean[UNI_KICK[c(1:2)]])) %>%
+  
+   #Creating Total Euclidean for Kick Team (3-7th closest players, EXCLUDING KR)
+  mutate(KTC3T6 = sum(Euclidean[UNI_KICK[c(3:6)]])) %>% 
+  
+    #Creating Total Euclidean for Return Team
+  mutate(RTE = sum(Euclidean[UNI_KICK[c(12:22)]]))  %>% 
+  
+  #Creating Total Euclidean for Return Team (First 2 closest players, EXCLUDING KR)
+  mutate(RTC2 = sum(Euclidean[UNI_KICK[c(13:14)]])) %>%
+  
+   #Creating Total Euclidean for Return Team (3-7th closest players, EXCLUDING KR)
+  mutate(RTC3T6 = sum(Euclidean[UNI_KICK[c(15:18)]])) %>% 
+  
+   #Creating Mean Euclidean for Kick Team
+  mutate(KME = mean(Euclidean[UNI_KICK[c(1:11)]]))  %>% 
+  
+  #Creating Mean Euclidean for Kick Team (First 2 closest players, EXCLUDING KR)
+  mutate(KMC2 = mean(Euclidean[UNI_KICK[c(1:2)]])) %>%
+  
+   #Creating Mean Euclidean for Kick Team (3-7th closest players, EXCLUDING KR)
+  mutate(KMC3T6 = mean(Euclidean[UNI_KICK[c(3:6)]])) %>% 
+  
+    #Creating Mean Euclidean for Kick Team
+  mutate(RME = mean(Euclidean[UNI_KICK[c(12:22)]]))  %>% 
+  
+  #Creating Mean Euclidean for Kick Team (First 2 closest players, EXCLUDING KR)
+  mutate(RMC2 = mean(Euclidean[UNI_KICK[c(13:14)]])) %>%
+  
+   #Creating Mean Euclidean for Kick Team (3-7th closest players, EXCLUDING KR)
+  mutate(RMC3T6 = mean(Euclidean[UNI_KICK[c(15:18)]])) %>% 
+  
+    #Creating sd Euclidean for Kick Team
+  mutate(KSDE = sd(Euclidean[UNI_KICK[c(1:11)]]))  %>% 
+  
+  #Creating sd Euclidean for Kick Team (First 2 closest players, EXCLUDING KR)
+  mutate(KSDC2 = sd(Euclidean[UNI_KICK[c(1:2)]])) %>%
+  
+   #Creating sd Euclidean for Kick Team (3-7th closest players, EXCLUDING KR)
+  mutate(KSDC3T6 = sd(Euclidean[UNI_KICK[c(3:6)]])) %>% 
+  
+    #Creating sd Euclidean for Kick Team
+  mutate(RSDE = sd(Euclidean[UNI_KICK[c(12:22)]]))  %>% 
+  
+  #Creating sd Euclidean for Kick Team (First 2 closest players, EXCLUDING KR)
+  mutate(RSDC2 = sd(Euclidean[UNI_KICK[c(13:14)]])) %>%
+  
+   #Creating sd Euclidean for Kick Team (3-7th closest players, EXCLUDING KR)
+  mutate(RSD3T6 = sd(Euclidean[UNI_KICK[c(15:18)]])) %>% 
+
+#Creating Total a for Kick Team
+  mutate(AccKTE = sum(a[UNI_KICK[c(1:11)]]))  %>% 
+  
+  #Creating Total a for Kick Team (First 2 closest players, EXCLUDING KR)
+  mutate(AccKTC2 = sum(a[UNI_KICK[c(1:2)]])) %>%
+  
+   #Creating Total a for Kick Team (3-7th closest players, EXCLUDING KR)
+  mutate(AccKTC3T6 = sum(a[UNI_KICK[c(3:6)]])) %>% 
+  
+#Creating Mean a for Kick Team
+  mutate(AccKME = mean(a[UNI_KICK[c(1:11)]]))  %>% 
+  
+  #Creating Mean a for Kick Team (First 2 closest players, EXCLUDING KR)
+  mutate(AccKMC2 = mean(a[UNI_KICK[c(1:2)]])) %>%
+  
+   #Creating Mean a for Kick Team (3-7th closest players, EXCLUDING KR)
+  mutate(AccKMC3T6 = mean(a[UNI_KICK[c(3:6)]])) %>%
+
+  #Creating sd a for Kick Team
+  mutate(AccKSDE = sd(a[UNI_KICK[c(1:11)]]))  %>% 
+  
+  #Creating sd a for Kick Team (First 2 closest players, EXCLUDING KR)
+  mutate(AccKSDC2 = sd(a[UNI_KICK[c(1:2)]])) %>%
+  
+   #Creating sd a for Kick Team (3-7th closest players, EXCLUDING KR)
+  mutate(AccKSDC3T6 = sd(a[UNI_KICK[c(3:6)]])) %>% 
+  
+#Creating Total s for Kick Team
+  mutate(SPKTE = sum(s[UNI_KICK[c(1:11)]]))  %>% 
+  
+  #Creating Total s for Kick Team (First 2 closest players, EXCLUDING KR)
+  mutate(SPKTC2 = sum(s[UNI_KICK[c(1:2)]])) %>%
+  
+   #Creating Total s for Kick Team (3-7th closest players, EXCLUDING KR)
+  mutate(SPKTC3T6 = sum(s[UNI_KICK[c(3:6)]])) %>% 
+  
+#Creating Mean s for Kick Team
+  mutate(SPKME = mean(s[UNI_KICK[c(1:11)]]))  %>% 
+  
+  #Creating Mean s for Kick Team (First 2 closest players, EXCLUDING KR)
+  mutate(SPKMC2 = mean(s[UNI_KICK[c(1:2)]])) %>%
+  
+   #Creating Mean s for Kick Team (3-7th closest players, EXCLUDING KR)
+  mutate(SPKMC3T6 = mean(s[UNI_KICK[c(3:6)]])) %>%
+
+  #Creating sd s for Kick Team
+  mutate(SPKSDE = sd(s[UNI_KICK[c(1:11)]]))  %>% 
+  
+  #Creating sd s for Kick Team (First 2 closest players, EXCLUDING KR)
+  mutate(SPKSDC2 = sd(s[UNI_KICK[c(1:2)]])) %>%
+  
+   #Creating sd s for Kick Team (3-7th closest players, EXCLUDING KR)
+  mutate(SPKSDC3T6 = sd(s[UNI_KICK[c(3:6)]])) %>% 
+    
+    #Creating Total dir for Kick Team
+  mutate(DirKTE = sum(dir[UNI_KICK[c(1:11)]]))  %>% 
+  
+  #Creating Total dir for Kick Team (First 2 closest players, EXCLUDING KR)
+  mutate(DirKTC2 = sum(dir[UNI_KICK[c(1:2)]])) %>%
+  
+   #Creating Total dir for Kick Team (3-7th closest players, EXCLUDING KR)
+  mutate(DirKTC3T6 = sum(dir[UNI_KICK[c(3:6)]])) %>% 
+  
+#Creating Mean dir for Kick Team
+  mutate(DirKME = mean(dir[UNI_KICK[c(1:11)]]))  %>% 
+  
+  #Creating Mean dir for Kick Team (First 2 closest players, EXCLUDING KR)
+  mutate(DirKMC2 = mean(dir[UNI_KICK[c(1:2)]])) %>%
+  
+   #Creating Mean dir for Kick Team (3-7th closest players, EXCLUDING KR)
+  mutate(DirKMC3T6 = mean(dir[UNI_KICK[c(3:6)]])) %>%
+
+  #Creating sd dir for Kick Team
+  mutate(DirKSDE = sd(dir[UNI_KICK[c(1:11)]]))  %>% 
+  
+  #Creating sd dir for Kick Team (First 2 closest players, EXCLUDING KR)
+  mutate(DirKSDC2 = sd(dir[UNI_KICK[c(1:2)]])) %>%
+  
+   #Creating sd dir for Kick Team (3-7th closest players, EXCLUDING KR)
+  mutate(DirKSDC3T6 = sd(dir[UNI_KICK[c(3:6)]])) %>% 
+    
+    #Creating Total o for Kick Team
+  mutate(oKTE = sum(o[UNI_KICK[c(1:11)]]))  %>% 
+  
+  #Creating Total o for Kick Team (First 2 closest players, EXCLUDING KR)
+  mutate(oKTC2 = sum(o[UNI_KICK[c(1:2)]])) %>%
+  
+   #Creating Total o for Kick Team (3-7th closest players, EXCLUDING KR)
+  mutate(oKTC3T6 = sum(o[UNI_KICK[c(3:6)]])) %>% 
+  
+#Creating Mean o for Kick Team
+  mutate(oKME = mean(o[UNI_KICK[c(1:11)]]))  %>% 
+  
+  #Creating Mean o for Kick Team (First 2 closest players, EXCLUDING KR)
+  mutate(oKMC2 = mean(o[UNI_KICK[c(1:2)]])) %>%
+  
+   #Creating Mean o for Kick Team (3-7th closest players, EXCLUDING KR)
+  mutate(oKMC3T6 = mean(o[UNI_KICK[c(3:6)]])) %>%
+
+  #Creating sd o for Kick Team
+  mutate(oKSDE = sd(o[UNI_KICK[c(1:11)]]))  %>% 
+  
+  #Creating sd o for Kick Team (First 2 closest players, EXCLUDING KR)
+  mutate(oKSDC2 = sd(o[UNI_KICK[c(1:2)]])) %>%
+  
+   #Creating sd o for Kick Team (3-7th closest players, EXCLUDING KR)
+  mutate(oKSDC3T6 = sd(o[UNI_KICK[c(3:6)]]))  %>%
+  
+  
+  #Getting Rid of non-important variables 
+  select(., -(assistTackler:Teams)) %>% 
+  
+  #Seperating out list of missed tacklers into a separate column for each missed tackle
+ separate(missedTackler,into = c("MT1","MT2","MT3","MT4"),sep = ";") %>% 
+  
+  #Replace missing values in missed tackle columns and Penalty yards column
+  replace_na(list(MT1 = 0, MT2 =0, MT3 = 0, MT4 = 0, penaltyYards = 0)) %>%
+  
+  #Binary Encoding the Missed Tackle Columns to show just the prescence of the ith missed tackle
+  mutate(NMT1 = ifelse(MT1 == 0 ,0,1)) %>% mutate(NMT2 = ifelse(MT2 == 0 ,0,1)) %>%
+  mutate(NMT3 = ifelse(MT3 == 0 ,0,1)) %>% mutate(NMT4 = ifelse(MT4 == 0 ,0,1)) %>%
+  
+#Add together the binary values of each missed tackle across the rows to get total # of missed tackles on each play, labeled Total Missed Tackles (TMT)
+  mutate(TMT = NMT1+NMT2+NMT3+NMT4) %>%
+  
+  #Take out columns of non-importance at this point 
+  dplyr::select(., - (MT1:MT4),-(NMT1:NMT4)) %>%
+  
+  #exclude any NA values
+  na.exclude() %>% 
+  
+  #filter for only the KR
+  filter(., a_pos=="AKR") %>% 
+  
+  #Getting rid of variables not needed 
+  select(., -dis,-(frameId:playId), -(UKI:UPI), -(RecTeam:UNI_KICK), -playDirection, -(kickType:returnDirectionIntended))  %>% 
+  
+  #Creating dummy column for categortical return direction actual
+  dummy_columns(., select_columns = "returnDirectionActual") %>% 
+  
+  #Delete the categorical variable from the data 
+  select(., -returnDirectionActual)
+
+#set this data set for later
+df_CDS <- df_KRKO
+
+#Creating data set with only euclidean distance sorted by team
+df_OED <- select(df_KRKO, -UPI,-(returnDirectionActual_C:returnDirectionActual_R)) %>% na.exclude()
+df_OED<- as.data.frame(df_OED)
+
+```
+
+```{r}
+#Data Cleaning this set
+
+#Evaluating variables of importance in a random forest model
+OED_rf_var_test<- randomForest(kickReturnYardage ~., data = df_OED)
+
+#evaluating variable importance of the first random forest model
+I_SCORE_FUNC(OED_rf_var_test)
+
+#The results lean towards including orientation instead of direction, and more of an emphasis on speed than acceleration
+
+#Creating data set without direction and without any of the mean variables
+OED_df_NT_WO <- df_OED %>% select(.,-dir,-(DirKTE:DirKSDC3T6), -(KME:RMC3T6),-(AccKME:AccKMC3T6), -(SPKME:SPKMC3T6), - (DirKME:DirKMC3T6), -(oKME:oKMC3T6) )
+
+#head of new data set
+head(OED_df_NT_WO)
+
+#Creating a random forest to measure important variables 
+OED_rf_var_test_1<- randomForest(kickReturnYardage ~., data = OED_df_NT_WO)
+
+#Important variables score
+I_SCORE_FUNC(OED_rf_var_test_1)
+
+#Checking for zero variance variables
+OED_ZV <- nearZeroVar(df_OED, saveMetrics= TRUE)
+  #Results = No variables with 0 variance 
+
+#Original data 
+
+#Getting linear dependence 
+OED_lc <- findLinearCombos(df_OED)
+#data from without linear dependence 
+OED_df_WC <- df_OED[, -OED_lc$remove] 
+  #essentially just removed the variables that represented the mean
+# Filtering out correlated variables 
+OED_descrCor <-  cor(OED_df_WC)
+OED_highCorr <- sum(abs(OED_descrCor[upper.tri(OED_descrCor)]) > .999)
+OED_highlyCorDescr <- findCorrelation(OED_descrCor, cutoff = .75)
+OED_df_WC <- OED_df_WC[,-OED_highlyCorDescr]
+OED_descrCor2 <- cor(OED_df_WC)
+
+#Narrowed down data 
+
+#Getting rid of linear dependence 
+OED_lc1 <- findLinearCombos(OED_df_NT_WO)
+   # no linear dependence
+
+# Filtering out correlated variables 
+OED_descrCor_1 <-  cor(OED_df_NT_WO)
+OED_highCorr_1 <- sum(abs(OED_descrCor_1[upper.tri(OED_descrCor_1)]) > .999)
+OED_highlyCorDescr_1 <- findCorrelation(OED_descrCor_1, cutoff = .75)
+OED_df_NT_WO_1 <- OED_df_NT_WO[,-OED_highlyCorDescr_1]
+OED_descrCor2_1 <- cor(OED_df_NT_WO_1)
+
+#Transforming cleaned data sets
+OED_preProcValues2 <- preProcess(df_OED, method = c("center","scale","YeoJohnson"))
+OED_train_d <- predict(OED_preProcValues2, df_OED)
+
+OED_preProcValues3 <- preProcess(OED_df_NT_WO, method = c("center","scale","YeoJohnson"))
+OED_train_d_1 <- predict(OED_preProcValues3, OED_df_NT_WO)
+
+OED_preProcValues4 <- preProcess(OED_df_WC, method = c("center","scale","YeoJohnson"))
+OED_train_d_2 <- predict(OED_preProcValues4, OED_df_WC)
+
+#Getting rid of linear dependence 
+OED_lc2 <- findLinearCombos(OED_train_d)
+OED_df_TD <- OED_train_d[, -OED_lc2$remove]
+
+# Filtering out correlated variables 
+OED_descrCor_3 <-  cor(OED_df_TD)
+OED_highCorr_3 <- sum(abs(OED_descrCor_3[upper.tri(OED_descrCor_3)]) > .999)
+OED_highlyCorDescr_3 <- findCorrelation(OED_descrCor_3, cutoff = .75)
+OED_df_TD <- OED_df_TD[,-OED_highlyCorDescr_3]
+OED_descrCor2_3 <- cor(OED_df_TD)
+
+#Feature Selection using caret package
+
+#random forest
+ctrl <- rfeControl(functions = rfFuncs,
+                   method = "cv",
+                   verbose = FALSE)
+
+#Random Forest feature selection
+#df_OED
+#OED_lmProfile1 <- rfe(x=df_OED[,-7], y=df_OED$kickReturnYardage,
+               #  rfeControl = ctrl)
+
+#OED_df_NT_WO_1
+#OED_lmProfile3<- rfe(x=OED_df_NT_WO_1[,-5], y=OED_df_NT_WO_1$kickReturnYardage,
+                # rfeControl = ctrl)
+
+#df_TD
+#OED_lmProfile4 <- rfe(x=OED_df_TD[,-6], y=OED_df_TD$kickReturnYardage,
+               #  rfeControl = ctrl)
+
+#df_WC
+#OED_lmProfile5 <- rfe(x=OED_df_WC[,-5], y=OED_df_WC$kickReturnYardage,
+                 #rfeControl = ctrl)
+
+#train_d
+#OED_lmProfile6 <- rfe(x=OED_train_d[,-7], y=OED_train_d$kickReturnYardage,
+                 #rfeControl = ctrl)
+
+#train_d1
+#OED_lmProfile7 <- rfe(x=OED_train_d_1[,-6], y=OED_train_d_1$kickReturnYardage,
+                # rfeControl = ctrl)
+
+#train_d2
+#OED_lmProfile8 <- rfe(x=OED_train_d_2[,-5], y=OED_train_d_2$kickReturnYardage,
+                # rfeControl = ctrl)
+
+#conclusion from this step is that the transformed data frequenctly performs better, so thats what will be used from here on out
+
+#PCA analysis:
+#Full transformed data set
+OED_preProc_1 <- preProcess(OED_train_d[,-7],method="pca",thresh = 0.85)
+OED_trainPC_1 <- predict(OED_preProc_1,OED_train_d[,-7])
+
+#Narrowed down and clean data set
+OED_preProc_2 <- preProcess(OED_df_NT_WO_1[,-5],method="pca",thresh = 0.85)
+OED_trainPC_2 <- predict(OED_preProc_2,OED_df_NT_WO_1[,-5])
+
+
+#Full transformed data set
+OED_preProc_3 <- preProcess(OED_df_TD[,-6],method="pca",thresh = 0.85)
+OED_trainPC_3 <- predict(OED_preProc_3,OED_df_TD[,-6])
+
+#Setting up parameter tuning 
+
+fitControl <- trainControl(## 10-fold CV
+                           method = "repeatedcv",
+                           number = 10,
+                           repeats = 10)
+
+#Neural Networks
+
+  #Original Data
+
+# OED_train_d
+OED_NN_M1 <- train(kickReturnYardage~., data = OED_train_d, 
+               method = "nnet", trControl = fitControl,
+               linout = TRUE)
+
+# OED_train_d_1
+OED_NN_M2 <- train(kickReturnYardage~., data = OED_train_d_1, 
+               method = "nnet", trControl = fitControl,
+               linout = TRUE)
+#OED_df_TD 
+OED_NN_M3 <- train(kickReturnYardage~., data = OED_df_TD, 
+               method = "nnet", trControl = fitControl,
+               linout = TRUE)
+
+#PCA models
+
+#OED_train_d
+OED_NN_PM1 <- train(kickReturnYardage~., data = OED_train_d, 
+               method = "nnet", trControl = fitControl,
+               linout = TRUE,preProcess = "pca")
+
+# OED_train_d_1
+OED_NN_PM2 <- train(kickReturnYardage~., data = OED_train_d_1, 
+               method = "nnet", trControl = fitControl,
+               linout = TRUE,preProcess = "pca")
+#OED_df_TD 
+OED_NN_PM3 <- train(kickReturnYardage~., data = OED_df_TD, 
+               method = "nnet", trControl = fitControl,
+               linout = TRUE,preProcess = "pca")
+
+
+#CART
+
+#set seed 
+set.seed(123)
+#Create Tune grid
+OED_Grid <- expand.grid(cp=seq(0, 0.05, 0.005))
+#Fit rpart1
+OED_fit.rpartCV <- train(kickReturnYardage ~. , data=OED_df_TD, method = 'rpart', trControl=fitControl, metric='RMSE',maximize=FALSE, tuneGrid = OED_Grid)
+#Fit second Tune Grid
+OED_Grid_1<-expand.grid(.maxdepth=seq(5,20,5))
+
+OED_fit.rpart2CV <- train(kickReturnYardage ~. , data=OED_df_TD, method = 'rpart2', trControl=fitControl, metric = 'RMSE', maximize=FALSE, tuneGrid=OED_Grid_1)
+
+plot(OED_fit.rpartCV)
+plot(OED_fit.rpart2CV)
+
+#glmnet
+library(glmnet)
+
+#OED_train_d
+OED_GNET_M1 <- train(kickReturnYardage~., data = OED_train_d, 
+               method = "glmnet", trControl = fitControl)
+
+# OED_train_d_1
+OED_GNET_M2 <- train(kickReturnYardage~., data = OED_train_d_1, 
+               method = "glmnet", trControl = fitControl)
+#OED_df_TD 
+OED_GNET_M3 <- train(kickReturnYardage~., data = OED_df_TD, 
+               method = "glmnet", trControl = fitControl)
+
+#PCA models
+
+#OED_train_d
+OED_GNET_PM1 <- train(kickReturnYardage~., data = OED_train_d, 
+               method = "glmnet", trControl = fitControl,
+               linout = TRUE,preProcess = "pca")
+
+# OED_train_d_1
+OED_GNET_PM2 <- train(kickReturnYardage~., data = OED_train_d_1, 
+               method = "glmnet", trControl = fitControl,preProcess = "pca")
+#OED_df_TD 
+OED_GNET_PM3 <- train(kickReturnYardage~., data = OED_df_TD, 
+               method = "glmnet", trControl = fitControl,preProcess = "pca")
+
+#elastic net
+library(elasticnet)
+
+#OED_train_d
+OED_EN_M1 <- train(kickReturnYardage~., data = OED_train_d, 
+               method = "enet", trControl = fitControl)
+
+# OED_train_d_1
+OED_EN_M2 <- train(kickReturnYardage~., data = OED_train_d_1, 
+               method = "enet", trControl = fitControl)
+#OED_df_TD  
+OED_EN_M3 <- train(kickReturnYardage~., data = OED_df_TD, 
+               method = "enet", trControl = fitControl)
+
+#PCA models
+
+#OED_train_d
+OED_EN_PM1 <- train(kickReturnYardage~., data = OED_train_d, 
+               method = "enet", trControl = fitControl,preProcess = "pca")
+
+# OED_train_d_1
+OED_EN_PM2 <- train(kickReturnYardage~., data = OED_train_d_1, 
+               method = "enet", trControl = fitControl,preProcess = "pca")
+#OED_df_TD 
+OED_EN_PM3 <- train(kickReturnYardage~., data = OED_df_TD, 
+               method = "enet", trControl = fitControl,preProcess = "pca")
+
+#Ridge Regression:
+
+#OED_train_d
+OED_RD_M1 <- train(kickReturnYardage~., data = OED_train_d, 
+               method = "ridge", trControl = fitControl)
+
+# OED_train_d_1
+OED_RD_M2 <- train(kickReturnYardage~., data = OED_train_d_1, 
+               method = "ridge", trControl = fitControl)
+#OED_df_TD 
+OED_RD_M3 <- train(kickReturnYardage~., data = OED_df_TD, 
+               method = "ridge", trControl = fitControl)
+
+#PCA models
+
+#OED_train_d
+OED_RD_PM1 <- train(kickReturnYardage~., data = OED_train_d, 
+               method = "ridge", trControl = fitControl,preProcess = "pca")
+
+# OED_train_d_1
+OED_RD_PM2 <- train(kickReturnYardage~., data = OED_train_d_1, 
+               method = "ridge", trControl = fitControl,preProcess = "pca")
+#OED_df_TD 
+OED_RD_PM3 <- train(kickReturnYardage~., data = OED_df_TD, 
+               method = "ridge", trControl = fitControl,preProcess = "pca")
+
+#random Forest
+
+#OED_train_d
+#OED_RFM1 <- train(kickReturnYardage~., data = OED_train_d,  method = "rf", trControl = fitControl, mtry=10)
+
+# OED_train_d_1
+#OED_RFM2 <- train(kickReturnYardage~., data = OED_train_d_1,  method = "rf", trControl = fitControl)
+#OED_df_TD 
+#OED_RFM3 <- train(kickReturnYardage~., data = OED_df_TD, method = "rf", trControl = fitControl)
+
+#PCA models
+
+#OED_train_d
+#OED_RFPM1 <- train(kickReturnYardage~., data = OED_train_d,  method = "rf", trControl = fitControl,preProcess = "pca")
+
+# OED_train_d_1
+#OED_RFPM2 <- train(kickReturnYardage~., data = OED_train_d_1,  method = "rf", trControl = fitControl,preProcess = "pca")
+#OED_df_TD 
+#OED_RFPM3 <- train(kickReturnYardage~., data = OED_df_TD, method = "rf", trControl = fitControl,preProcess = "pca")
+
+#Linear Models
+OED_lm1 <- lm(kickReturnYardage ~. , data = OED_train_d)
+OED_lm2 <- lm(kickReturnYardage ~. , data = OED_train_d_1)
+OED_lm3 <- lm(kickReturnYardage ~. , data = OED_df_TD)
+
+
+OED_st1<- step(OED_lm1,trace=FALSE)
+OED_st2<- step(OED_lm2,trace=FALSE)
+OED_st3<- step(OED_lm3, trace=FALSE)
+
+
+#Print Section:
+
+#print all obejcts 
+
+OED_preProc_1
+OED_preProc_2
+OED_preProc_3
+OED_NN_M1
+OED_NN_M2
+OED_NN_M3
+OED_NN_PM1
+OED_NN_PM2
+OED_NN_PM3
+OED_fit.rpartCV
+OED_fit.rpart2CV
+plot(OED_fit.rpartCV)
+plot(OED_fit.rpart2CV)
+OED_GNET_M1
+OED_GNET_M2
+OED_GNET_M3
+OED_GNET_PM1
+OED_GNET_PM2
+OED_GNET_PM3
+OED_EN_M1
+OED_EN_M2
+OED_EN_M3
+OED_EN_PM1
+OED_EN_PM2
+OED_EN_PM3
+OED_RD_M1
+OED_RD_M2
+OED_RD_M3
+OED_RD_PM1
+OED_RD_PM2
+OED_RD_PM3
+
+summary(OED_lm1)
+summary(OED_lm2)
+summary(OED_lm3)
+summary(OED_st1)
+summary(OED_st2)
+summary(OED_st3)
+```
+
+
+```{r}
+# Creating data set with Kickoff position and Euclidean distances 
+KOEUC <- df_K %>% 
+  
+  #Left join with the point in the data set from before thats ideal to build on
+  left_join(df_FDS, by = "UKI") %>% 
+  
+  #filter at the moment of the KR receiving the ball
+  filter(., event == "kick_received") 
+
+#adjust kickoff position as character variable, and replace NAs with 0 
+KOEUC$KOP <- KOEUC$KOP %>% as.character() %>% replace_na(0)
+
+#head of KOEUC
+head(KOEUC)
+
+#Adjusting KOEUC to prepare for pivot
+AKOEUC <- KOEUC %>% 
+  
+  #Set the KR was a unqiue individual on the return team
+  mutate(KOP = replace(KOP,nflId==returnerId,"KR")) %>%
+  
+  #filter out the football from the data and arrange by the KR first 
+  filter(., displayName != "football") %>% arrange(.,a_pos) %>% 
+  
+  #Rename a variable that was change in the table join 
+   rename(.,UPI = UPI.x ) %>% 
+  
+  #Then grouping by each unique UPI 
+  group_by(UPI) %>%
+  
+  #Then creating the distance that each player/observation is from the Kick Returner
+   mutate(Euclidean = as.matrix(dist(cbind(x, y)))[1, ]) %>% ungroup()
+
+#head of AKOEUC
+head(AKOEUC)
+
+#Create another table to merge with AKOEUC called NFD
+NFD <- AKOEUC %>% 
+  
+  #filter for every player on the return team besides the KR
+  filter(., KOP == "0") %>% 
+  
+  #select variables of interest 
+  select(., x:dir,nflId,frameId:playDirection,kickReturnYardage:a_pos,KOP:Euclidean) %>%
+  
+  #arrange by the Euclidean
+  arrange(Euclidean) %>% 
+  
+  #Group by UPI
+  group_by(UPI) %>%  
+  
+  #Ranking by each distance for each play to determine the position from the KR
+  mutate(KOP = rank(Euclidean)) %>%
+  
+  #filter for any outlier or mistake in the code
+  filter(., KOP < 11) %>%  filter(., Euclidean > 0.0) %>%
+  
+  #select the new filled KOP variable 
+  select(., UKI, KOP) 
+
+#head of NDF
+head(NFD)
+
+#Data set to combine both data conditions 
+KOPDS <- AKOEUC %>% 
+  
+  #Merge filled return tea data set with filled kicking team data set 
+  left_join(NFD, by="UKI")%>%
+  
+  #replace 0s with NA in original kickoff position 
+  mutate(KOP.x = replace(KOP.x, KOP.x==0, NA)) %>% 
+  
+   #merge the two columns who have complementary missing values 
+  transform(., TKOP = ifelse(!is.na(KOP.x), KOP.x, KOP.y)) %>% 
+  
+  #select variables of interest 
+  select(., x:dir,frameId:playDirection,kickReturnYardage:a_pos,Euclidean,TKOP) %>% 
+  
+  #filter out any missing value of Kickoff position
+  filter(., TKOP != "NA") %>% 
+  
+  #Rename variables that were changed when the tables joing 
+  rename(.,UPI = UPI.x ) %>%
+  
+  #filter by unique play and only include plays with correct amount of players 
+  group_by(UPI) %>% filter(n()==22)
+
+#pivot wider for specific values based on Kickoff Position 
+
+#Euclidean table
+TA <- KOPDS %>% pivot_wider(.,id_cols = UPI, names_from = TKOP  , names_prefix = "Euc", values_from = Euclidean) %>% na.exclude()
+
+#Speed table 
+TB <- KOPDS %>% pivot_wider(.,id_cols = c(UPI), names_from = TKOP  , names_prefix = "Sp", values_from = s) %>% na.exclude()
+
+#Acceleration table 
+TC <- KOPDS %>% pivot_wider(.,id_cols = c(UPI), names_from = TKOP  , names_prefix = "Acc", values_from = a) %>% na.exclude()
+
+#Orientation table
+TD <- KOPDS %>% pivot_wider(.,id_cols = c(UPI), names_from = TKOP  , names_prefix = "Ori", values_from = o) %>% na.exclude()
+
+#x table 
+#TE <- KOPDS %>% pivot_wider(.,id_cols = c(UPI), names_from = TKOP  , names_prefix = "x", values_from = x) %>% na.exclude()
+
+#y table
+#TF <- KOPDS %>% pivot_wider(.,id_cols = c(UPI), names_from = TKOP  , names_prefix = "y", values_from = y) %>% na.exclude()
+
+#distance table 
+#TG <- KOPDS %>% pivot_wider(.,id_cols = c(UPI), names_from = TKOP  , names_prefix = "dis", values_from = dis) %>% na.exclude()
+
+#direction table 
+#TH <- KOPDS %>% pivot_wider(.,id_cols = c(UPI), names_from = TKOP  , names_prefix = "dir", values_from = dir) %>% na.exclude()
+
+# Data frame together (DFT), left join every table to matching UPI value 
+#DFT <- TA %>% left_join(TB) %>% left_join(TC) %>% left_join(TD) %>% left_join(TE)  %>% 
+  #left_join(TF) %>% left_join(TG) %>% left_join(TH)
+
+DFT <- TA %>% left_join(TB) %>% left_join(TC) %>% left_join(TD) 
+#head of DFT
+head(DFT)
+
+#Merge DFT with Euclidean values
+df_NT <- df_KRKO %>% left_join(DFT, by="UPI") %>% 
+  
+  #delete UPI and an empty value from the data set
+  select(.,-UPI, -EucKR)
+
+#head of df_NT
+head(df_NT)
+
+write.csv2(df_NT, file = "NT.csv")
+
+```
+
+```{r}
+#Checking models for variable importance 
+rf_var_test<- randomForest(kickReturnYardage ~., data = df_NT)
+
+#Variable Importance score
+I_SCORE_FUNC(rf_var_test)
+
+#The results lean towards including orientation instead of direction, and more of an emphasis on speed than acceleration
+
+#Creating data set without direction and without any of the mean variables
+df_NT_WO <- df_NT %>% select(.,-dir,-(DirKTE:DirKSDC3T6), -(KME:RMC3T6),-(AccKME:AccKMC3T6), -(SPKME:SPKMC3T6), - (DirKME:DirKMC3T6), -(oKME:oKMC3T6) )
+
+#head of df_NT_WO
+head(df_NT_WO)
+
+# Determining variables of importance 
+rf_var_test_1<- randomForest(kickReturnYardage ~., data = df_NT_WO)
+
+#Variable Importance score
+I_SCORE_FUNC(rf_var_test_1)
+
+#Checking data for zero variance variables
+ZV <- nearZeroVar(df_NT, saveMetrics= TRUE)
+  #Results = No variables with 0 variance 
+
+#Original data 
+
+#Getting linear dependence 
+lc <- findLinearCombos(df_NT)
+
+#data from without linear dependence 
+df_WC <- df_NT[, -lc$remove] 
+  #essentially just removed the variables that represented the mean
+
+# Filtering out correlated variables 
+descrCor <-  cor(df_WC)
+highCorr <- sum(abs(descrCor[upper.tri(descrCor)]) > .999)
+highlyCorDescr <- findCorrelation(descrCor, cutoff = .75)
+df_WC <- df_WC[,-highlyCorDescr]
+descrCor2 <- cor(df_WC)
+
+
+#Narrowed down data 
+
+#Getting rid of linear dependence 
+lc1 <- findLinearCombos(df_NT_WO)
+   # no linear dependence
+
+# Filtering out correlated variables 
+descrCor_1 <-  cor(df_NT_WO)
+highCorr_1 <- sum(abs(descrCor_1[upper.tri(descrCor_1)]) > .999)
+highlyCorDescr_1 <- findCorrelation(descrCor_1, cutoff = .75)
+df_NT_WO_1 <- df_NT_WO[,-highlyCorDescr_1]
+descrCor2_1 <- cor(df_NT_WO_1)
+
+
+#Transforming main data set
+preProcValues2 <- preProcess(df_NT, method = c("center","scale","YeoJohnson"))
+train_d <- predict(preProcValues2, df_NT)
+
+#head of train_d
+head(train_d)
+
+#Transforming cleaned data sets
+preProcValues3 <- preProcess(df_NT_WO, method = c("center","scale","YeoJohnson"))
+train_d_1 <- predict(preProcValues3, df_NT_WO)
+
+#head of train_d_1
+head(train_d_1)
+
+preProcValues4 <- preProcess(df_WC, method = c("center","scale","YeoJohnson"))
+train_d_2 <- predict(preProcValues4, df_WC)
+
+#head of train_d_2
+head(train_d_2)
+
+#Getting rid of linear dependence 
+lc2 <- findLinearCombos(train_d)
+df_TD <- train_d[, -lc2$remove]
+
+# Filtering out correlated variables 
+descrCor_3 <-  cor(df_TD)
+highCorr_3 <- sum(abs(descrCor_3[upper.tri(descrCor_3)]) > .999)
+highlyCorDescr_3 <- findCorrelation(descrCor_3, cutoff = .75)
+df_TD <- df_TD[,-highlyCorDescr_3]
+descrCor2_3 <- cor(df_TD)
+
+#Feature Selection using caret package for random forest
+
+#control function 
+ctrl <- rfeControl(functions = rfFuncs,
+                   method = "cv",
+                   verbose = FALSE)
+
+#Random Forest feature selection
+
+#df_NT
+#lmProfile1 <- rfe(x=df_NT[,-7], y=df_NT$kickReturnYardage,
+              #   rfeControl = ctrl)
+
+#df_NT_WO_1
+#lmProfile3<- rfe(x=df_NT_WO_1[,-1], y=df_NT_WO_1$kickReturnYardage,
+             #    rfeControl = ctrl)
+
+#df_TD
+#lmProfile4 <- rfe(x=df_TD[,-4], y=df_TD$kickReturnYardage,
+           #      rfeControl = ctrl)
+
+#df_WC
+#lmProfile5 <- rfe(x=df_WC[,-4], y=df_WC$kickReturnYardage,
+                # rfeControl = ctrl)
+
+#train_d
+#lmProfile6 <- rfe(x=train_d[,-7], y=train_d$kickReturnYardage,
+               #  rfeControl = ctrl)
+
+#train_d1
+#lmProfile7 <- rfe(x=train_d_1[,-6], y=train_d_1$kickReturnYardage,
+               #  rfeControl = ctrl)
+
+#train_d2
+#lmProfile8 <- rfe(x=train_d_2[,-4], y=train_d_2$kickReturnYardage,
+                # rfeControl = ctrl)
+
+#conclusion from this step is that the transformed data frequently performs better, so thats what will be used from here on out
+
+#PCA analysis:
+#Full transformed data set
+preProc_1 <- preProcess(train_d[,-7],method="pca",thresh = 0.85)
+trainPC_1 <- predict(preProc_1,train_d[,-7])
+
+#Narrowed down and clean data set
+preProc_2 <- preProcess(train_d_1[,-6],method="pca",thresh = 0.85)
+trainPC_2 <- predict(preProc_2,train_d_1[,-6])
+
+
+#Full transformed data set
+preProc_3 <- preProcess(df_TD[,-6],method="pca",thresh = 0.85)
+trainPC_3 <- predict(preProc_3,df_TD[,-6])
+
+#Setting up parameter tuning 
+fitControl <- trainControl(## 10-fold CV
+                           method = "repeatedcv",
+                           number = 10,
+                           repeats = 10)
+
+#Neural Networks
+
+  #Original Data
+
+#train_d
+NN_M1 <- train(kickReturnYardage~., data = train_d, 
+               method = "nnet", trControl = fitControl,
+               linout = TRUE)
+
+# train_d_1 
+NN_M2 <- train(kickReturnYardage~., data = train_d_1, 
+               method = "nnet", trControl = fitControl,
+               linout = TRUE)
+# df_TD 
+NN_M3 <- train(kickReturnYardage~., data = df_TD, 
+               method = "nnet", trControl = fitControl,
+               linout = TRUE)
+
+#PCA models
+
+#train_d
+NN_PM1 <- train(kickReturnYardage~., data = train_d, 
+               method = "nnet", trControl = fitControl,
+               linout = TRUE,preProcess = "pca")
+
+# train_d_1 
+NN_PM2 <- train(kickReturnYardage~., data = train_d_1, 
+               method = "nnet", trControl = fitControl,
+               linout = TRUE,preProcess = "pca")
+# df_TD 
+NN_PM3 <- train(kickReturnYardage~., data = df_TD, 
+               method = "nnet", trControl = fitControl,
+               linout = TRUE,preProcess = "pca")
+
+#CART
+set.seed(123)
+
+fitControl <- trainControl(## 10-fold CV
+                           method = "repeatedcv",
+                           number = 10,
+                           repeats = 10)
+
+Grid <- expand.grid(cp=seq(0, 0.05, 0.005))
+
+
+fit.rpartCV <- train(kickReturnYardage ~. , data=df_TD, method = 'rpart', trControl=fitControl, metric='RMSE',maximize=FALSE, tuneGrid = Grid)
+
+##model2b: rpart2 with CV
+set.seed(123)
+
+Grid_1<-expand.grid(.maxdepth=seq(5,20,5))
+
+fit.rpart2CV <- train(kickReturnYardage ~. , data=df_TD, method = 'rpart2', trControl=fitControl, metric = 'RMSE', maximize=FALSE, tuneGrid=Grid_1)
+
+plot(fit.rpartCV)
+plot(fit.rpart2CV)
+
+#glmnet
+library(glmnet)
+
+#train_d
+GNET_M1 <- train(kickReturnYardage~., data = train_d, 
+               method = "glmnet", trControl = fitControl)
+
+# train_d_1 
+GNET_M2 <- train(kickReturnYardage~., data = train_d_1, 
+               method = "glmnet", trControl = fitControl)
+# df_TD 
+GNET_M3 <- train(kickReturnYardage~., data = df_TD, 
+               method = "glmnet", trControl = fitControl)
+
+#PCA models
+
+#train_d
+GNET_PM1 <- train(kickReturnYardage~., data = train_d, 
+               method = "glmnet", trControl = fitControl,
+               linout = TRUE,preProcess = "pca")
+
+# train_d_1 
+GNET_PM2 <- train(kickReturnYardage~., data = train_d_1, 
+               method = "glmnet", trControl = fitControl,preProcess = "pca")
+# df_TD 
+GNET_PM3 <- train(kickReturnYardage~., data = df_TD, 
+               method = "glmnet", trControl = fitControl,preProcess = "pca")
+
+#elastic net
+library(elasticnet)
+
+#train_d
+EN_M1 <- train(kickReturnYardage~., data = train_d, 
+               method = "enet", trControl = fitControl,
+               linout = TRUE)
+
+# train_d_1 
+EN_M2 <- train(kickReturnYardage~., data = train_d_1, 
+               method = "enet", trControl = fitControl,
+               linout = TRUE)
+# df_TD 
+EN_M3 <- train(kickReturnYardage~., data = df_TD, 
+               method = "enet", trControl = fitControl,
+               linout = TRUE)
+
+#PCA models
+
+#train_d
+EN_PM1 <- train(kickReturnYardage~., data = train_d, 
+               method = "enet", trControl = fitControl,preProcess = "pca")
+
+# train_d_1 
+EN_PM2 <- train(kickReturnYardage~., data = train_d_1, 
+               method = "enet", trControl = fitControl,preProcess = "pca")
+# df_TD 
+EN_PM3 <- train(kickReturnYardage~., data = df_TD, 
+               method = "enet", trControl = fitControl,preProcess = "pca")
+
+#Ridge Regression:
+
+#train_d
+RD_M1 <- train(kickReturnYardage~., data = train_d, 
+               method = "ridge", trControl = fitControl)
+
+# train_d_1 
+RD_M2 <- train(kickReturnYardage~., data = train_d_1, 
+               method = "ridge", trControl = fitControl)
+# df_TD 
+RD_M3 <- train(kickReturnYardage~., data = df_TD, 
+               method = "ridge", trControl = fitControl)
+
+#PCA models
+
+#train_d
+RD_PM1 <- train(kickReturnYardage~., data = train_d, 
+               method = "ridge", trControl = fitControl,preProcess = "pca")
+
+# train_d_1 
+RD_PM2 <- train(kickReturnYardage~., data = train_d_1, 
+               method = "ridge", trControl = fitControl,preProcess = "pca")
+# df_TD 
+RD_PM3 <- train(kickReturnYardage~., data = df_TD, 
+               method = "ridge", trControl = fitControl,preProcess = "pca")
+```
+
+```{r}
+#random Forest
+
+#train_d
+RFM1 <- train(kickReturnYardage~., data = train_d, 
+              method = "rf", trControl = fitControl)
+
+# train_d_1 
+RFM2 <- train(kickReturnYardage~., data = train_d_1, 
+              method = "rf", trControl = fitControl)
+# df_TD 
+#RFM3 <- train(kickReturnYardage~., data = df_TD, 
+              # method = "rf", trControl = fitControl)
+
+#PCA models
+
+#train_d
+#RFPM1 <- train(kickReturnYardage~., data = train_d,method = "rf", trControl = fitControl,preProcess = "pca")
+
+# train_d_1 
+#RFPM2 <- train(kickReturnYardage~., data = train_d_1, 
+               #method = "rf", trControl = fitControl,preProcess = "pca")
+# df_TD 
+#RFPM3 <- train(kickReturnYardage~., data = df_TD, 
+               #method = "rf", trControl = fitControl,preProcess = "pca")
+
+#Linear Models
+#lm1 <- lm(kickReturnYardage ~. , data = train_d)
+#lm2 <- lm(kickReturnYardage ~. , data = train_d_1)
+#lm3 <- lm(kickReturnYardage ~. , data = df_TD)
+
+#Stepped Linear Models 
+#st1<- step(lm1)
+#st2<- step(lm2)
+#st3<- step(lm3)
+
+#print all obejcts 
+preProc_1
+preProc_2
+preProc_3
+NN_M1
+NN_M2
+NN_M3
+NN_PM1
+NN_PM2
+NN_PM3
+fit.rpartCV
+fit.rpart2CV
+plot(fit.rpartCV)
+plot(fit.rpart2CV)
+GNET_M1
+GNET_M2
+GNET_M3
+GNET_PM1
+GNET_PM2
+GNET_PM3
+EN_M1
+EN_M2
+EN_M3
+EN_PM1
+EN_PM2
+EN_PM3
+RD_M1
+RD_M2
+RD_M3
+RD_PM1
+RD_PM2
+RD_PM3
+
+```
+
+```{r}
+#linear models:
+
+#Linear Models
+lm1 <- lm(kickReturnYardage ~. , data = train_d)
+lm2 <- lm(kickReturnYardage ~. , data = train_d_1)
+lm3 <- lm(kickReturnYardage ~. , data = df_TD)
+lm4 <- lm(kickReturnYardage ~. , data = df_NT)
+lm5 <- lm(kickReturnYardage ~. , data = df_NT_WO)
+lm6 <- lm(kickReturnYardage ~. , data = df_WC)
+lm7 <- lm(kickReturnYardage ~. , data = OED_train_d)
+lm8 <- lm(kickReturnYardage ~. , data = OED_train_d_1)
+lm9 <- lm(kickReturnYardage ~. , data = OED_df_TD)
+lm10 <- lm(kickReturnYardage ~. , data = df_OED)
+lm11 <- lm(kickReturnYardage ~. , data = OED_df_NT_WO)
+lm12 <- lm(kickReturnYardage ~. , data = OED_df_WC)
+
+#Stepped Linear Models 
+st1<- step(lm1,trace = FALSE)
+st2<- step(lm2,trace = FALSE)
+st3<- step(lm3,trace = FALSE)
+st4<- step(lm4,trace = FALSE)
+st5<- step(lm5,trace = FALSE)
+st6<- step(lm6,trace = FALSE)
+st7<- step(lm7,trace = FALSE)
+st8<- step(lm8,trace = FALSE)
+st9<- step(lm9,trace = FALSE)
+st10<- step(lm10,trace = FALSE)
+st11<- step(lm11,trace = FALSE)
+st12<- step(lm12,trace = FALSE)
+
+```
+
+```{r}
+#Creating Prediction Data for all data sets 
+df_p <- df_tracking_1
+df_tracking_N <- df_p %>%
+                mutate(x = ifelse(playDirection == "left", 120-x, x),
+                       y = ifelse(playDirection == "left", 160/3 - y, y))
+
+#First Data Set
+
+#creating data frame that will only includes Kick Returns that were actually returned. 
+PRED_df_first_ko <- df_tracking_N %>%
+    #joining the scouting data
+    left_join(df_plays, by = c("gameId", "playId")) %>%
+    #filtering for kickoff plays only
+    filter(specialTeamsPlayType == "Kickoff") %>%
+  #filtering for only kicks that were returned
+  filter(kickReturnYardage != "NA") %>%
+  #Subsetting desireable variables
+  select(., time:playDirection, possessionTeam:kickBlockerId,kickReturnYardage)
+
+#Creating a new variable where I change a categorical level of the position variable to differentiate the kick returner from the rest (The "A" prefix was added to be able to run code later that matches the positioning of the variable)
+PRED_df_first_ko_1 <- PRED_df_first_ko %>% group_by(gameId,playId,frameId) %>%  mutate(a_pos = replace(position,nflId==returnerId,"AKR"))
+
+#Setting aside this separate data set for a later step
+PRED_df_Kickoffs_A <- PRED_df_first_ko_1 %>% select(., -time,-(nflId:team),-(gameId:a_pos)) %>% filter(.,event=="tackle")
+
+#Arranging the data by the new position variable, so kick returner is at the top 
+PRED_df_first_ko_2 <- PRED_df_first_ko_1 %>% arrange(.,a_pos) %>% 
+  #Then grouping by each unique frame in each unique play
+  group_by(gameId,playId,frameId) %>%
+  #Then creating the distance that each player/observation is from the Kick Returner
+   mutate(Euclidean = as.matrix(dist(cbind(x, y)))[1, ]) %>%
+  #ungrouping the data
+  ungroup()
+
+#Data set for later
+ PRED_df_ko_rf_a <- PRED_df_first_ko_2
+
+#Grouping the data again by each unqiue frame
+PRED_df_first_ko_3 <- PRED_df_first_ko_2 %>% group_by(gameId,playId,frameId) %>%
+  #Creating a unique ID for every other player in each frame (including football =23)
+  mutate(UniPlayInd = row_number()) %>%
+  ungroup()
+
+#Matching each unique distance to its unique frameId and relative player relationship
+PRED_TestEuc<- PRED_df_first_ko_3 %>% pivot_wider(.,id_cols = c(gameId,playId,frameId,UniPlayInd), names_from = UniPlayInd, names_prefix = "Euc", values_from = Euclidean)
+
+#Converting Home/Away to Binary
+  #Might need to change method of encoding teams
+PRED_df_first_ko_3$HomeTrue <- PRED_df_first_ko_3$team == "home"
+PRED_df_first_ko_3$HomeTrue <- as.integer(PRED_df_first_ko_3$HomeTrue)
+
+#Home/away Hot encode
+PRED_Home_Away_Table <- PRED_df_first_ko_3 %>% pivot_wider(.,id_cols = c(gameId,playId,frameId,UniPlayInd), names_from = UniPlayInd, names_prefix = "Home", values_from = HomeTrue)
+
+#Combining tables 
+ PRED_df_first_ko_4 <- PRED_df_first_ko_3 %>% left_join(.,PRED_TestEuc, by = c("gameId","playId","frameId")) %>% left_join(.,PRED_Home_Away_Table, by = c("gameId","playId","frameId"))
+ 
+
+ # Converting None to NA for events in Kickoff Data set
+PRED_df_first_ko_4$event<- recode_factor(PRED_df_first_ko_4$event, None = NA_character_)
+PRED_df_first_ko_4$event<- recode_factor(PRED_df_first_ko_4$event, kickoff = NA_character_)
+ 
+
+# Filtering out all other observation besides Kick Returners
+ PRED_df_first_ko_5 <- PRED_df_first_ko_4 %>% filter(., a_pos == "AKR") %>%
+ 
+ #Cleaning up unnessecary columns:
+ select(., -time, -(displayName:team),- (playDirection:specialTeamsResult),-(returnerId:kickBlockerId), -(a_pos:Euc1)) %>% 
+   #Filtering to only have the moment the KR catches the ball.
+   filter(., event =="kick_received") 
+ 
+#Data set 2 
+ 
+#setting up team specific data sets
+PRED_DS_KO_2 <- PRED_df_ko_rf_a %>% 
+  
+  #Join with games data set
+  inner_join(df_games)  %>% 
+  
+  #Put specific team names for each player based off home/away
+  mutate(Teams = ifelse(team=="home",homeTeamAbbr,visitorTeamAbbr)) %>% 
+  
+  #Creating variable to show what team is recieving the the ball during the KO
+  mutate(RecTeam = if_else(possessionTeam==Teams,"Kick","Rec")) %>% 
+  
+  #filter for only observations with the kicking team AND the KR
+  filter(.,RecTeam == "Kick" | a_pos == "AKR") %>% 
+  
+  #Arrange by Euclidean
+  arrange(.,Euclidean)  %>% 
+  
+  #Delete the football from the observations 
+  filter(., displayName != "football") %>% 
+  
+  #Subset every play to the moment the KR receives the ball
+  filter(., event =="kick_received") %>%
+  
+  #Select Variables of Importance
+  select(., -time,-event,-(displayName:team),-(playDirection:kickBlockerId),-(season:Teams)) %>%
+  
+  #Group by gameId and playId
+  group_by(gameId,playId) %>% 
+  
+  #Create a Unique Identifier for players on the kicking team (and KR)
+  mutate(UniPlayInd = row_number()) %>% filter(., UniPlayInd < 13 )
+
+#Create dummy tables 
+
+#Euclidean Table
+PRED_XB <- PRED_DS_KO_2 %>% pivot_wider(.,id_cols = c(gameId,playId), names_from = UniPlayInd  , names_prefix = "Euc", values_from = Euclidean)
+
+#Speed Table
+PRED_XC <- PRED_DS_KO_2 %>% pivot_wider(.,id_cols = c(gameId,playId), names_from = UniPlayInd  , names_prefix = "Speed", values_from = s)
+
+#Acceleration Table
+PRED_XD <- PRED_DS_KO_2 %>% pivot_wider(.,id_cols = c(gameId,playId), names_from = UniPlayInd  , names_prefix = "Acc", values_from = a)
+ 
+#Orientation Table
+PRED_XE <- PRED_DS_KO_2 %>% pivot_wider(.,id_cols = c(gameId,playId), names_from = UniPlayInd  , names_prefix = "Ori", values_from = o)
+
+#Subsetting main data to only have the observation focused on the KR
+PRED_XA <- subset(PRED_DS_KO_2, a_pos == "AKR")
+
+#Creating Full Team Data (FT)
+PRED_FT <- PRED_XA %>% 
+  
+  #left join all the dummy tables 
+  left_join(PRED_XB) %>% left_join(PRED_XC) %>% left_join(PRED_XD) %>% left_join(PRED_XE) %>% 
+  
+  #Join with PFF scouting data set
+  left_join(df_PFFScouting) %>% 
+  
+  #Select only variables of interest 
+  select(., -(nflId:playId),-(a_pos:Euc1),-Speed1,-Acc1,-Ori1,-(snapDetail:operationTime),-(kickDirectionIntended:kickDirectionActual),-(missedTackler:tackler),-(gunners:kickContactType)) %>% 
+  
+  #Filter out missing values of hangtime and observations with no KR yards
+  filter(., hangTime != "NA") %>% filter(.,kickReturnYardage != "NA")
+
+#Delete all NAs from the Data set
+PRED_FT<- na.exclude(PRED_FT)
+
+
+#Third data set
+#creating data frame that will only includes Kick Returns that were actually returned. 
+PRED_df_K <- df_tracking_N %>%
+  
+    #joining the scouting data
+    left_join(df_plays, by = c("gameId", "playId")) %>%
+  
+    #filtering for kickoff plays only
+    filter(specialTeamsPlayType == "Kickoff") %>%
+  
+  #filtering for only kicks that were returned
+  filter(kickReturnYardage != "NA") %>%
+  
+  #Subsetting desireable variables
+  select(., time:playDirection, possessionTeam:kickBlockerId,kickReturnYardage) %>% 
+  
+  #Creating Unique Indefintifer based off nflId, gameId, and playId
+  mutate(UKI = unique_identifier(., fields = c("nflId", "gameId","playId"))) %>% 
+  
+  #Create Unique Identifier for each unique play across all games and seasons
+  mutate(UPI = unique_identifier(., fields = c("gameId","playId"))) %>%
+  
+  #Joining with PFF scouting data table
+  left_join(df_PFFScouting) %>%
+  
+  #joining data with games data set
+  inner_join(df_games)  %>% 
+
+  #Sorting teams by home and away for each game into one column
+  mutate(Teams = ifelse(team=="home",homeTeamAbbr,visitorTeamAbbr)) %>% 
+  
+  #Sorting by which team is the Kicking and Receiving team for each game 
+  mutate(RecTeam = if_else(possessionTeam==Teams,"Kick","Rec")) %>% 
+
+  #Creating a new variable where I change a categorical level of the position variable to differentiate the kick returner from the rest (The "A" prefix was added to be able to run code later that matches the positioning of the variable)
+  group_by(UPI,frameId) %>%  mutate(a_pos = replace(position,nflId==returnerId,"AKR")) 
+
+#Head of df_K
+head(PRED_df_K)
+
+
+#Arranging the data by the new position variable, so kick returner is at the top 
+PRED_df_KOP <- PRED_df_K %>% arrange(.,a_pos) %>% 
+  
+  #Subsetting the data to the moment the Kick Returner receives the kick
+ filter(., event == "kickoff")   %>% 
+  
+  #Subset to only include the Kicking Team
+  filter(.,RecTeam == "Kick") %>% 
+  
+  #Creating categorical variable to differentiate between Kicker and non-kicker
+  mutate(KickerYN = ifelse(nflId==kickerId,"A","B")) %>% 
+  
+  #Cleaning up errors in the data to ensure only players in KickerYN level A , is a kicker
+  filter(., returnerId != "NA") %>%
+  
+  #Arrange with the kickers at the top
+  arrange(., KickerYN) %>% 
+  
+  #Reset group and filter at the point of the kickoff and subset by each unique play 
+   group_by(UPI) %>% 
+  
+  #Creating a variable to find the distance from the kicker
+  mutate(DistKick = y - first(y)) %>%  
+  
+  #ungrouping the data and filter to delete the football out of the data 
+  ungroup () %>% filter(., displayName != "football") %>%
+  
+  #Arrange by the Distance Kick
+  arrange(DistKick) %>% 
+  
+  #Group by each play each unique play 
+  group_by(UPI)  %>%  
+  
+  #Ranking by each distance for each play to determine the position from the kicker, setting up KOP (KOP = Kickoff position)
+  mutate(KOP = rank(DistKick)) %>% 
+  
+  #Recoding the factors to match the position on the kickoff 
+  mutate(KOP = as.factor(KOP), KOP = fct_recode(KOP, "L1" ="1", "L2"="2","L3"="3","L4"="4","L5"="5", "K"="6","R5"="7","R4"="8","R3"="9","R2"="10","R1"="11")) 
+
+#Selecting the unique identifier and the Kickoff Position, and ungrouping the data
+PRED_df_KOP <- PRED_df_KOP %>% select(., UKI, KOP)  %>% ungroup()
+
+#head df_KOP
+head(PRED_df_KOP)
+
+#Create data set for later use 
+PRED_df_FDS <- PRED_df_KOP
+
+#Setting up main kickoff tracking dataset 
+# Creating Inital Kickoff Tracking (KOT_I) by joining main tracking and Kickoff Position by unique identifier 
+PRED_df_KOT_I <- PRED_df_K %>% left_join(PRED_df_KOP, by = "UKI") %>%
+  
+  #Filter by the moment the kick was receieved by the kick returner
+  filter(., event == "kick_received") 
+
+#Converting kickoff position to character and replacing NAs with 0s
+PRED_df_KOT_I$KOP <- PRED_df_KOT_I$KOP %>% as.character() %>% replace_na(0)
+
+#head df_KOT_I
+head(PRED_df_KOT_I)
+
+#Creating Main Kickoff tracking data set 
+PRED_df_KOT<- PRED_df_KOT_I %>% 
+  
+  #Mutating Kickoff Position to add unique level of Kick Returner
+  mutate(KOP = replace(KOP,nflId==returnerId,"KR")) %>%
+  
+  #Filtering out the football from the tracking data and arrange by position 
+  filter(., displayName != "football") %>% arrange(.,a_pos) %>% 
+  
+  #Renaming the key variables that were altered by the table join
+  rename(.,UPI = UPI.x ) %>% 
+  
+  #Then grouping by each unique frame in each unique play
+  group_by(UPI) %>%
+  
+  #Then creating the distance that each player/observation is from the Kick Returner and ungroup
+  mutate(Euclidean = as.matrix(dist(cbind(x, y)))[1, ]) %>% ungroup()
+
+#head of df_KOT
+head(PRED_df_KOT)
+
+#Creating cleaning data set to fill in Missing Kick returner position values by proximity to KR
+PRED_df_clean <- PRED_df_KOT %>%
+  
+  #Filtering for absent Position values
+  filter(., KOP == "0") %>% 
+  
+  #Selecting only variables needed to fill KOP values 
+  select(., x:dir,nflId,frameId:playDirection,kickReturnYardage:a_pos,KOP:Euclidean) %>%
+  
+  #Arrange by the Euclidean values 
+  arrange(Euclidean) %>% 
+  
+  #Group by each play each unique play 
+  group_by(UPI) %>% 
+  
+  #Ranking by each distance for each play to determine the position from the KR
+  mutate(KOP = rank(Euclidean)) %>%
+  
+  #Filtering out plays where data had a typo and didn't follow previous code
+  filter(., KOP < 11) %>% filter(., Euclidean > 0.0) %>%
+  
+  #Selecting Kick Return Euclidean Position and unique Identifier
+  select(., UKI, KOP)
+
+ #print df_clean
+ head(PRED_df_clean)
+
+#Creating Merge data set to combine all values of Kickoff Position into one column 
+PRED_df_KRKO <- PRED_df_KOT %>% left_join(PRED_df_clean, by="UKI")%>% 
+  
+  #Identifying NAs in original KOP column to show where df_clean$KOP values will go
+  mutate(KOP.x = replace(KOP.x, KOP.x==0, NA)) %>% 
+  
+  #Defining new Total KOP (TKOP), that uses both KOP columns to create the complete column
+  transform(., TKOP = ifelse(!is.na(KOP.x), KOP.x, KOP.y)) %>%
+  
+  #Selecting variables of interest
+  select(., x:dir,frameId:playDirection,kickReturnYardage:UPI.x,hangTime:kickoffReturnFormation, Teams:a_pos,Euclidean,TKOP) %>% 
+  
+  #Filter out any plays where TKOP could not be identified
+  filter(., TKOP != "NA") %>% 
+  
+  #Rename variables that were altered by the table join
+  rename(.,UPI = UPI.x )%>%
+  
+  #Arranging the data set by Euclidean Distances
+  arrange(RecTeam,Euclidean) %>%
+  
+  #Grouping by 
+  group_by(UPI) %>% 
+  
+  #Creating Unique Ident variable for only the Kicking team based on Euclidean Position from the KR 
+  mutate(UNI_KICK = row_number()) %>% 
+  
+  #Getting rid of play that didn't sort correctly 
+  filter(.,UNI_KICK < 23) %>% ungroup() %>%
+  
+  #Group by unique play id, and filtering the lower bound to make sure every play has exactly 22 obs.
+  group_by(UPI) %>% filter(n()>20) %>%
+  
+  #arrange by UNI_KICK
+  arrange(UNI_KICK) %>%
+
+  #Creating Total Euclidean for Kick Team
+  mutate(KTE = sum(Euclidean[UNI_KICK[c(1:11)]]))  %>% 
+  
+  #Creating Total Euclidean for Kick Team (First 2 closest players, EXCLUDING KR)
+  mutate(KTC2 = sum(Euclidean[UNI_KICK[c(1:2)]])) %>%
+  
+   #Creating Total Euclidean for Kick Team (3-7th closest players, EXCLUDING KR)
+  mutate(KTC3T6 = sum(Euclidean[UNI_KICK[c(3:6)]])) %>% 
+  
+    #Creating Total Euclidean for Return Team
+  mutate(RTE = sum(Euclidean[UNI_KICK[c(12:22)]]))  %>% 
+  
+  #Creating Total Euclidean for Return Team (First 2 closest players, EXCLUDING KR)
+  mutate(RTC2 = sum(Euclidean[UNI_KICK[c(13:14)]])) %>%
+  
+   #Creating Total Euclidean for Return Team (3-7th closest players, EXCLUDING KR)
+  mutate(RTC3T6 = sum(Euclidean[UNI_KICK[c(15:18)]])) %>% 
+  
+   #Creating Mean Euclidean for Kick Team
+  mutate(KME = mean(Euclidean[UNI_KICK[c(1:11)]]))  %>% 
+  
+  #Creating Mean Euclidean for Kick Team (First 2 closest players, EXCLUDING KR)
+  mutate(KMC2 = mean(Euclidean[UNI_KICK[c(1:2)]])) %>%
+  
+   #Creating Mean Euclidean for Kick Team (3-7th closest players, EXCLUDING KR)
+  mutate(KMC3T6 = mean(Euclidean[UNI_KICK[c(3:6)]])) %>% 
+  
+    #Creating Mean Euclidean for Kick Team
+  mutate(RME = mean(Euclidean[UNI_KICK[c(12:22)]]))  %>% 
+  
+  #Creating Mean Euclidean for Kick Team (First 2 closest players, EXCLUDING KR)
+  mutate(RMC2 = mean(Euclidean[UNI_KICK[c(13:14)]])) %>%
+  
+   #Creating Mean Euclidean for Kick Team (3-7th closest players, EXCLUDING KR)
+  mutate(RMC3T6 = mean(Euclidean[UNI_KICK[c(15:18)]])) %>% 
+  
+    #Creating sd Euclidean for Kick Team
+  mutate(KSDE = sd(Euclidean[UNI_KICK[c(1:11)]]))  %>% 
+  
+  #Creating sd Euclidean for Kick Team (First 2 closest players, EXCLUDING KR)
+  mutate(KSDC2 = sd(Euclidean[UNI_KICK[c(1:2)]])) %>%
+  
+   #Creating sd Euclidean for Kick Team (3-7th closest players, EXCLUDING KR)
+  mutate(KSDC3T6 = sd(Euclidean[UNI_KICK[c(3:6)]])) %>% 
+  
+    #Creating sd Euclidean for Kick Team
+  mutate(RSDE = sd(Euclidean[UNI_KICK[c(12:22)]]))  %>% 
+  
+  #Creating sd Euclidean for Kick Team (First 2 closest players, EXCLUDING KR)
+  mutate(RSDC2 = sd(Euclidean[UNI_KICK[c(13:14)]])) %>%
+  
+   #Creating sd Euclidean for Kick Team (3-7th closest players, EXCLUDING KR)
+  mutate(RSD3T6 = sd(Euclidean[UNI_KICK[c(15:18)]])) %>% 
+
+#Creating Total a for Kick Team
+  mutate(AccKTE = sum(a[UNI_KICK[c(1:11)]]))  %>% 
+  
+  #Creating Total a for Kick Team (First 2 closest players, EXCLUDING KR)
+  mutate(AccKTC2 = sum(a[UNI_KICK[c(1:2)]])) %>%
+  
+   #Creating Total a for Kick Team (3-7th closest players, EXCLUDING KR)
+  mutate(AccKTC3T6 = sum(a[UNI_KICK[c(3:6)]])) %>% 
+  
+#Creating Mean a for Kick Team
+  mutate(AccKME = mean(a[UNI_KICK[c(1:11)]]))  %>% 
+  
+  #Creating Mean a for Kick Team (First 2 closest players, EXCLUDING KR)
+  mutate(AccKMC2 = mean(a[UNI_KICK[c(1:2)]])) %>%
+  
+   #Creating Mean a for Kick Team (3-7th closest players, EXCLUDING KR)
+  mutate(AccKMC3T6 = mean(a[UNI_KICK[c(3:6)]])) %>%
+
+  #Creating sd a for Kick Team
+  mutate(AccKSDE = sd(a[UNI_KICK[c(1:11)]]))  %>% 
+  
+  #Creating sd a for Kick Team (First 2 closest players, EXCLUDING KR)
+  mutate(AccKSDC2 = sd(a[UNI_KICK[c(1:2)]])) %>%
+  
+   #Creating sd a for Kick Team (3-7th closest players, EXCLUDING KR)
+  mutate(AccKSDC3T6 = sd(a[UNI_KICK[c(3:6)]])) %>% 
+  
+#Creating Total s for Kick Team
+  mutate(SPKTE = sum(s[UNI_KICK[c(1:11)]]))  %>% 
+  
+  #Creating Total s for Kick Team (First 2 closest players, EXCLUDING KR)
+  mutate(SPKTC2 = sum(s[UNI_KICK[c(1:2)]])) %>%
+  
+   #Creating Total s for Kick Team (3-7th closest players, EXCLUDING KR)
+  mutate(SPKTC3T6 = sum(s[UNI_KICK[c(3:6)]])) %>% 
+  
+#Creating Mean s for Kick Team
+  mutate(SPKME = mean(s[UNI_KICK[c(1:11)]]))  %>% 
+  
+  #Creating Mean s for Kick Team (First 2 closest players, EXCLUDING KR)
+  mutate(SPKMC2 = mean(s[UNI_KICK[c(1:2)]])) %>%
+  
+   #Creating Mean s for Kick Team (3-7th closest players, EXCLUDING KR)
+  mutate(SPKMC3T6 = mean(s[UNI_KICK[c(3:6)]])) %>%
+
+  #Creating sd s for Kick Team
+  mutate(SPKSDE = sd(s[UNI_KICK[c(1:11)]]))  %>% 
+  
+  #Creating sd s for Kick Team (First 2 closest players, EXCLUDING KR)
+  mutate(SPKSDC2 = sd(s[UNI_KICK[c(1:2)]])) %>%
+  
+   #Creating sd s for Kick Team (3-7th closest players, EXCLUDING KR)
+  mutate(SPKSDC3T6 = sd(s[UNI_KICK[c(3:6)]])) %>% 
+    
+    #Creating Total dir for Kick Team
+  mutate(DirKTE = sum(dir[UNI_KICK[c(1:11)]]))  %>% 
+  
+  #Creating Total dir for Kick Team (First 2 closest players, EXCLUDING KR)
+  mutate(DirKTC2 = sum(dir[UNI_KICK[c(1:2)]])) %>%
+  
+   #Creating Total dir for Kick Team (3-7th closest players, EXCLUDING KR)
+  mutate(DirKTC3T6 = sum(dir[UNI_KICK[c(3:6)]])) %>% 
+  
+#Creating Mean dir for Kick Team
+  mutate(DirKME = mean(dir[UNI_KICK[c(1:11)]]))  %>% 
+  
+  #Creating Mean dir for Kick Team (First 2 closest players, EXCLUDING KR)
+  mutate(DirKMC2 = mean(dir[UNI_KICK[c(1:2)]])) %>%
+  
+   #Creating Mean dir for Kick Team (3-7th closest players, EXCLUDING KR)
+  mutate(DirKMC3T6 = mean(dir[UNI_KICK[c(3:6)]])) %>%
+
+  #Creating sd dir for Kick Team
+  mutate(DirKSDE = sd(dir[UNI_KICK[c(1:11)]]))  %>% 
+  
+  #Creating sd dir for Kick Team (First 2 closest players, EXCLUDING KR)
+  mutate(DirKSDC2 = sd(dir[UNI_KICK[c(1:2)]])) %>%
+  
+   #Creating sd dir for Kick Team (3-7th closest players, EXCLUDING KR)
+  mutate(DirKSDC3T6 = sd(dir[UNI_KICK[c(3:6)]])) %>% 
+    
+    #Creating Total o for Kick Team
+  mutate(oKTE = sum(o[UNI_KICK[c(1:11)]]))  %>% 
+  
+  #Creating Total o for Kick Team (First 2 closest players, EXCLUDING KR)
+  mutate(oKTC2 = sum(o[UNI_KICK[c(1:2)]])) %>%
+  
+   #Creating Total o for Kick Team (3-7th closest players, EXCLUDING KR)
+  mutate(oKTC3T6 = sum(o[UNI_KICK[c(3:6)]])) %>% 
+  
+#Creating Mean o for Kick Team
+  mutate(oKME = mean(o[UNI_KICK[c(1:11)]]))  %>% 
+  
+  #Creating Mean o for Kick Team (First 2 closest players, EXCLUDING KR)
+  mutate(oKMC2 = mean(o[UNI_KICK[c(1:2)]])) %>%
+  
+   #Creating Mean o for Kick Team (3-7th closest players, EXCLUDING KR)
+  mutate(oKMC3T6 = mean(o[UNI_KICK[c(3:6)]])) %>%
+
+  #Creating sd o for Kick Team
+  mutate(oKSDE = sd(o[UNI_KICK[c(1:11)]]))  %>% 
+  
+  #Creating sd o for Kick Team (First 2 closest players, EXCLUDING KR)
+  mutate(oKSDC2 = sd(o[UNI_KICK[c(1:2)]])) %>%
+  
+   #Creating sd o for Kick Team (3-7th closest players, EXCLUDING KR)
+  mutate(oKSDC3T6 = sd(o[UNI_KICK[c(3:6)]]))  %>%
+  
+  
+  #Getting Rid of non-important variables 
+  select(., -(assistTackler:Teams)) %>% 
+  
+  #Seperating out list of missed tacklers into a separate column for each missed tackle
+ separate(missedTackler,into = c("MT1","MT2","MT3","MT4"),sep = ";") %>% 
+  
+  #Replace missing values in missed tackle columns and Penalty yards column
+  replace_na(list(MT1 = 0, MT2 =0, MT3 = 0, MT4 = 0, penaltyYards = 0)) %>%
+  
+  #Binary Encoding the Missed Tackle Columns to show just the prescence of the ith missed tackle
+  mutate(NMT1 = ifelse(MT1 == 0 ,0,1)) %>% mutate(NMT2 = ifelse(MT2 == 0 ,0,1)) %>%
+  mutate(NMT3 = ifelse(MT3 == 0 ,0,1)) %>% mutate(NMT4 = ifelse(MT4 == 0 ,0,1)) %>%
+  
+#Add together the binary values of each missed tackle across the rows to get total # of missed tackles on each play, labeled Total Missed Tackles (TMT)
+  mutate(TMT = NMT1+NMT2+NMT3+NMT4) %>%
+  
+  #Take out columns of non-importance at this point 
+  dplyr::select(., - (MT1:MT4),-(NMT1:NMT4)) %>%
+  
+  #exclude any NA values
+  na.exclude() %>% 
+  
+  #filter for only the KR
+  filter(., a_pos=="AKR") %>% 
+  
+  #Getting rid of variables not needed 
+  select(., -dis,-(frameId:playId), -(UKI:UPI), -(RecTeam:UNI_KICK), -playDirection, -(kickType:returnDirectionIntended))  %>% 
+  
+  #Creating dummy column for categortical return direction actual
+  dummy_columns(., select_columns = "returnDirectionActual") %>% 
+  
+  #Delete the categorical variable from the data 
+  select(., -returnDirectionActual)
+
+# Creating data set with Kickoff position and Euclidean distances 
+PRED_KOEUC <- PRED_df_K %>% 
+  
+  #Left join with the point in the data set from before thats ideal to build on
+  left_join(PRED_df_FDS, by = "UKI") %>% 
+  
+  #filter at the moment of the KR receiving the ball
+  filter(., event == "kick_received") 
+
+#adjust kickoff position as character variable, and replace NAs with 0 
+PRED_KOEUC$KOP <- PRED_KOEUC$KOP %>% as.character() %>% replace_na(0)
+
+#head of KOEUC
+head(KOEUC)
+
+#Adjusting KOEUC to prepare for pivot
+PRED_AKOEUC <- PRED_KOEUC %>% 
+  
+  #Set the KR was a unqiue individual on the return team
+  mutate(KOP = replace(KOP,nflId==returnerId,"KR")) %>%
+  
+  #filter out the football from the data and arrange by the KR first 
+  filter(., displayName != "football") %>% arrange(.,a_pos) %>% 
+  
+  #Rename a variable that was change in the table join 
+   rename(.,UPI = UPI.x ) %>% 
+  
+  #Then grouping by each unique UPI 
+  group_by(UPI) %>%
+  
+  #Then creating the distance that each player/observation is from the Kick Returner
+   mutate(Euclidean = as.matrix(dist(cbind(x, y)))[1, ]) %>% ungroup()
+
+#head of AKOEUC
+head(AKOEUC)
+
+#Create another table to merge with AKOEUC called NFD
+PRED_NFD <- PRED_AKOEUC %>% 
+  
+  #filter for every player on the return team besides the KR
+  filter(., KOP == "0") %>% 
+  
+  #select variables of interest 
+  select(., x:dir,nflId,frameId:playDirection,kickReturnYardage:a_pos,KOP:Euclidean) %>%
+  
+  #arrange by the Euclidean
+  arrange(Euclidean) %>% 
+  
+  #Group by UPI
+  group_by(UPI) %>%  
+  
+  #Ranking by each distance for each play to determine the position from the KR
+  mutate(KOP = rank(Euclidean)) %>%
+  
+  #filter for any outlier or mistake in the code
+  filter(., KOP < 11) %>%  filter(., Euclidean > 0.0) %>%
+  
+  #select the new filled KOP variable 
+  select(., UKI, KOP) 
+
+#head of NDF
+head(NFD)
+
+#Data set to combine both data conditions 
+PRED_KOPDS <- PRED_AKOEUC %>% 
+  
+  #Merge filled return tea data set with filled kicking team data set 
+  left_join(PRED_NFD, by="UKI")%>%
+  
+  #replace 0s with NA in original kickoff position 
+  mutate(KOP.x = replace(KOP.x, KOP.x==0, NA)) %>% 
+  
+   #merge the two columns who have complementary missing values 
+  transform(., TKOP = ifelse(!is.na(KOP.x), KOP.x, KOP.y)) %>% 
+  
+  #select variables of interest 
+  select(., x:dir,frameId:playDirection,kickReturnYardage:a_pos,Euclidean,TKOP) %>% 
+  
+  #filter out any missing value of Kickoff position
+  filter(., TKOP != "NA") %>% 
+  
+  #Rename variables that were changed when the tables joing 
+  rename(.,UPI = UPI.x ) %>%
+  
+  #filter by unique play and only include plays with correct amount of players 
+  group_by(UPI) %>% filter(n()==22)
+
+#pivot wider for specific values based on Kickoff Position 
+
+#Euclidean table
+PRED_TA <- PRED_KOPDS %>% pivot_wider(.,id_cols = UPI, names_from = TKOP  , names_prefix = "Euc", values_from = Euclidean) %>% na.exclude()
+
+#Speed table 
+PRED_TB <- PRED_KOPDS %>% pivot_wider(.,id_cols = c(UPI), names_from = TKOP  , names_prefix = "Sp", values_from = s) %>% na.exclude()
+
+#Acceleration table 
+PRED_TC <- PRED_KOPDS %>% pivot_wider(.,id_cols = c(UPI), names_from = TKOP  , names_prefix = "Acc", values_from = a) %>% na.exclude()
+
+#Orientation table
+PRED_TD <- PRED_KOPDS %>% pivot_wider(.,id_cols = c(UPI), names_from = TKOP  , names_prefix = "Ori", values_from = o) %>% na.exclude()
+
+#x table 
+#TE <- KOPDS %>% pivot_wider(.,id_cols = c(UPI), names_from = TKOP  , names_prefix = "x", values_from = x) %>% na.exclude()
+
+#y table
+#TF <- KOPDS %>% pivot_wider(.,id_cols = c(UPI), names_from = TKOP  , names_prefix = "y", values_from = y) %>% na.exclude()
+
+#distance table 
+#TG <- KOPDS %>% pivot_wider(.,id_cols = c(UPI), names_from = TKOP  , names_prefix = "dis", values_from = dis) %>% na.exclude()
+
+#direction table 
+#TH <- KOPDS %>% pivot_wider(.,id_cols = c(UPI), names_from = TKOP  , names_prefix = "dir", values_from = dir) %>% na.exclude()
+
+# Data frame together (DFT), left join every table to matching UPI value 
+#DFT <- TA %>% left_join(TB) %>% left_join(TC) %>% left_join(TD) %>% left_join(TE)  %>% left_join(TF) %>% left_join(TG) %>% left_join(TH)
+
+PRED_DFT <- PRED_TA %>% left_join(PRED_TB) %>% left_join(PRED_TC) %>% left_join(PRED_TD) 
+#head of DFT
+head(DFT)
+
+#Merge DFT with Euclidean values
+PRED_df_NT <- PRED_df_KRKO %>% left_join(PRED_DFT, by="UPI") %>% 
+  
+  #delete UPI and an empty value from the data set
+  select(.,-UPI, -EucKR)
+
+
+#Creating data set with only euclidean distance sorted by team
+PRED_df_OED <- select(PRED_df_KRKO, -UPI,-(returnDirectionActual_C:returnDirectionActual_R)) %>% na.exclude()
+PRED_df_OED<- as.data.frame(PRED_df_OED)
+
+#Data Cleaning this set
+#Creating data set without direction and without any of the mean variables
+PRED_OED_df_NT_WO <- PRED_df_OED %>% select(.,-dir,-(DirKTE:DirKSDC3T6), -(KME:RMC3T6),-(AccKME:AccKMC3T6), -(SPKME:SPKMC3T6), - (DirKME:DirKMC3T6), -(oKME:oKMC3T6) )
+
+#head of new data set
+head(PRED_OED_df_NT_WO)
+
+#Checking for zero variance variables
+PRED_OED_ZV <- nearZeroVar(PRED_df_OED, saveMetrics= TRUE)
+  #Results = No variables with 0 variance 
+
+#Original data 
+
+#Getting linear dependence 
+PRED_OED_lc <- findLinearCombos(PRED_df_OED)
+#data from without linear dependence 
+PRED_OED_df_WC <- PRED_df_OED[, -PRED_OED_lc$remove] 
+  #essentially just removed the variables that represented the mean
+# Filtering out correlated variables 
+PRED_OED_descrCor <-  cor(PRED_OED_df_WC)
+PRED_OED_highCorr <- sum(abs(PRED_OED_descrCor[upper.tri(PRED_OED_descrCor)]) > .999)
+PRED_OED_highlyCorDescr <- findCorrelation(PRED_OED_descrCor, cutoff = .75)
+PRED_OED_df_WC <- PRED_OED_df_WC[,-PRED_OED_highlyCorDescr]
+PRED_OED_descrCor2 <- cor(PRED_OED_df_WC)
+
+#Narrowed down data 
+
+#Getting rid of linear dependence 
+PRED_OED_lc1 <- findLinearCombos(PRED_OED_df_NT_WO)
+   # no linear dependence
+
+# Filtering out correlated variables 
+PRED_OED_descrCor_1 <-  cor(PRED_OED_df_NT_WO)
+PRED_OED_highCorr_1 <- sum(abs(PRED_OED_descrCor_1[upper.tri(PRED_OED_descrCor_1)]) > .999)
+PRED_OED_highlyCorDescr_1 <- findCorrelation(PRED_OED_descrCor_1, cutoff = .75)
+PRED_OED_df_NT_WO_1 <- PRED_OED_df_NT_WO[,-PRED_OED_highlyCorDescr_1]
+PRED_OED_descrCor2_1 <- cor(PRED_OED_df_NT_WO_1)
+
+#Transforming cleaned data sets
+PRED_OED_preProcValues2 <- preProcess(PRED_df_OED, method = c("center","scale","YeoJohnson"))
+PRED_OED_train_d <- predict(PRED_OED_preProcValues2, PRED_df_OED)
+
+PRED_OED_preProcValues3 <- preProcess(PRED_OED_df_NT_WO, method = c("center","scale","YeoJohnson"))
+PRED_OED_train_d_1 <- predict(PRED_OED_preProcValues3, PRED_OED_df_NT_WO)
+
+PRED_OED_preProcValues4 <- preProcess(PRED_OED_df_WC, method = c("center","scale","YeoJohnson"))
+PRED_OED_train_d_2 <- predict(PRED_OED_preProcValues4, PRED_OED_df_WC)
+
+#Getting rid of linear dependence 
+PRED_OED_lc2 <- findLinearCombos(PRED_OED_train_d)
+PRED_OED_df_TD <- PRED_OED_train_d[, -PRED_OED_lc2$remove]
+
+# Filtering out correlated variables 
+PRED_OED_descrCor_3 <-  cor(PRED_OED_df_TD)
+PRED_OED_highCorr_3 <- sum(abs(PRED_OED_descrCor_3[upper.tri(PRED_OED_descrCor_3)]) > .999)
+PRED_OED_highlyCorDescr_3 <- findCorrelation(PRED_OED_descrCor_3, cutoff = .75)
+PRED_OED_df_TD <- PRED_OED_df_TD[,-PRED_OED_highlyCorDescr_3]
+PRED_OED_descrCor2_3 <- cor(PRED_OED_df_TD)
+
+#PCA analysis:
+#Full transformed data set
+PRED_OED_preProc_1 <- preProcess(PRED_OED_train_d[,-7],method="pca",thresh = 0.85)
+PRED_OED_trainPC_1 <- predict(PRED_OED_preProc_1,PRED_OED_train_d[,-7])
+
+#Narrowed down and clean data set
+PRED_OED_preProc_2 <- preProcess(PRED_OED_df_NT_WO_1[,-5],method="pca",thresh = 0.85)
+PRED_OED_trainPC_2 <- predict(PRED_OED_preProc_2,PRED_OED_df_NT_WO_1[,-5])
+
+#Full transformed data set
+PRED_OED_preProc_3 <- preProcess(PRED_OED_df_TD[,-6],method="pca",thresh = 0.85)
+PRED_OED_trainPC_3 <- predict(PRED_OED_preProc_3,PRED_OED_df_TD[,-6])
+
+#Creating data set with only euclidean distance sorted by team
+#PRED_ <- select(PRED_, -UPI,-(returnDirectionActual_C:returnDirectionActual_R)) %>% na.exclude()
+#PRED_<- as.data.frame(PRED_)
+
+#Data Cleaning this set
+#Creating data set without direction and without any of the mean variables
+PRED_df_NT_WO <- PRED_df_NT %>% select(.,-dir,-(DirKTE:DirKSDC3T6), -(KME:RMC3T6),-(AccKME:AccKMC3T6), -(SPKME:SPKMC3T6), - (DirKME:DirKMC3T6), -(oKME:oKMC3T6) )
+
+#head of new data set
+head(PRED_df_NT_WO)
+
+#Checking for zero variance variables
+PRED_ZV <- nearZeroVar(PRED_df_NT, saveMetrics= TRUE)
+  #Results = No variables with 0 variance 
+
+#Original data 
+
+#Getting linear dependence 
+PRED_lc <- findLinearCombos(PRED_df_NT)
+#data from without linear dependence 
+PRED_df_WC <- PRED_df_NT[, -PRED_lc$remove] 
+  #essentially just removed the variables that represented the mean
+# Filtering out correlated variables 
+PRED_descrCor <-  cor(PRED_df_WC)
+PRED_highCorr <- sum(abs(PRED_descrCor[upper.tri(PRED_descrCor)]) > .999)
+PRED_highlyCorDescr <- findCorrelation(PRED_descrCor, cutoff = .75)
+PRED_df_WC <- PRED_df_WC[,-PRED_highlyCorDescr]
+PRED_descrCor2 <- cor(PRED_df_WC)
+
+#Narrowed down data 
+
+#Getting rid of linear dependence 
+PRED_lc1 <- findLinearCombos(PRED_df_NT_WO)
+   # no linear dependence
+
+# Filtering out correlated variables 
+PRED_descrCor_1 <-  cor(PRED_df_NT_WO)
+PRED_highCorr_1 <- sum(abs(PRED_descrCor_1[upper.tri(PRED_descrCor_1)]) > .999)
+PRED_highlyCorDescr_1 <- findCorrelation(PRED_descrCor_1, cutoff = .75)
+PRED_df_NT_WO_1 <- PRED_df_NT_WO[,-PRED_highlyCorDescr_1]
+PRED_descrCor2_1 <- cor(PRED_df_NT_WO_1)
+
+#Transforming cleaned data sets
+PRED_preProcValues2 <- preProcess(PRED_df_NT, method = c("center","scale","YeoJohnson"))
+PRED_train_d <- predict(PRED_preProcValues2, PRED_df_NT)
+
+PRED_preProcValues3 <- preProcess(PRED_df_NT_WO, method = c("center","scale","YeoJohnson"))
+PRED_train_d_1 <- predict(PRED_preProcValues3, PRED_df_NT_WO)
+
+PRED_preProcValues4 <- preProcess(PRED_df_WC, method = c("center","scale","YeoJohnson"))
+PRED_train_d_2 <- predict(PRED_preProcValues4, PRED_df_WC)
+
+#Getting rid of linear dependence 
+PRED_lc2 <- findLinearCombos(PRED_train_d)
+PRED_df_TD <- PRED_train_d[, -PRED_lc2$remove]
+
+# Filtering out correlated variables 
+PRED_descrCor_3 <-  cor(PRED_df_TD)
+PRED_highCorr_3 <- sum(abs(PRED_descrCor_3[upper.tri(PRED_descrCor_3)]) > .999)
+PRED_highlyCorDescr_3 <- findCorrelation(PRED_descrCor_3, cutoff = .75)
+PRED_df_TD <- PRED_df_TD[,-PRED_highlyCorDescr_3]
+PRED_descrCor2_3 <- cor(PRED_df_TD)
+
+#PCA analysis:
+#Full transformed data set
+PRED_preProc_1 <- preProcess(PRED_train_d[,-7],method="pca",thresh = 0.85)
+PRED_trainPC_1 <- predict(PRED_preProc_1,PRED_train_d[,-7])
+
+#Narrowed down and clean data set
+PRED_preProc_2 <- preProcess(PRED_df_NT_WO_1[,-5],method="pca",thresh = 0.85)
+PRED_trainPC_2 <- predict(PRED_preProc_2,PRED_df_NT_WO_1[,-5])
+
+#Full transformed data set
+PRED_preProc_3 <- preProcess(PRED_df_TD[,-6],method="pca",thresh = 0.85)
+PRED_trainPC_3 <- predict(PRED_preProc_3,PRED_df_TD[,-6])
+```
+
+```{r}
+VAL_PRED_1<-predict(NN_M1,newdata=PRED_train_d)
+VAL_PRED_2<-predict(NN_M2,newdata=PRED_train_d_1)
+VAL_PRED_3<-predict(NN_M3,newdata=PRED_df_TD)
+VAL_PRED_4<-predict(NN_PM1,newdata=PRED_train_d)
+VAL_PRED_5<-predict(NN_PM2,newdata=PRED_train_d_1)
+VAL_PRED_6<-predict(NN_PM3,newdata=PRED_df_TD)
+VAL_PRED_7<-predict(GNET_M1,newdata=PRED_train_d)
+VAL_PRED_8<-predict(GNET_M2,newdata=PRED_train_d_1)
+VAL_PRED_9<-predict(GNET_M3,newdata=PRED_df_TD)
+VAL_PRED_10<-predict(GNET_PM1,newdata=PRED_train_d)
+VAL_PRED_11<-predict(GNET_PM2,newdata=PRED_train_d_1)
+VAL_PRED_12<-predict(GNET_PM3,newdata=PRED_df_TD)
+VAL_PRED_13<-predict(EN_M1,newdata=PRED_train_d)
+VAL_PRED_14<-predict(EN_M2,newdata=PRED_train_d_1)
+VAL_PRED_15<-predict(EN_M3,newdata=PRED_df_TD)
+VAL_PRED_16<-predict(EN_PM1,newdata=PRED_train_d)
+VAL_PRED_17<-predict(EN_PM2,newdata=PRED_train_d_1)
+VAL_PRED_18<-predict(EN_PM3,newdata=PRED_df_TD)
+VAL_PRED_19<-predict(RD_M1,newdata=PRED_train_d)
+VAL_PRED_20<-predict(RD_M2,newdata=PRED_train_d_1)
+VAL_PRED_21<-predict(RD_M3,newdata=PRED_df_TD)
+VAL_PRED_22<-predict(RD_PM1,newdata=PRED_train_d)
+VAL_PRED_23<-predict(RD_PM2,newdata=PRED_train_d_1)
+VAL_PRED_24<-predict(RD_PM3,newdata=PRED_df_TD)
+VAL_PRED_25<-predict(RFM1,newdata=PRED_train_d)
+VAL_PRED_26<-predict(RFM2,newdata=PRED_train_d_1)
+VAL_PRED_27<-predict(RFM3,newdata=PRED_df_TD)
+VAL_PRED_28<-predict(RFPM1,newdata=PRED_train_d)
+VAL_PRED_29<-predict(RFPM2,newdata=PRED_train_d_1)
+VAL_PRED_30<-predict(RFPM3,newdata=PRED_df_TD)
+VAL_PRED_31<-predict(lm1,newdata=PRED_train_d)
+VAL_PRED_32<-predict(lm2,newdata=PRED_train_d_1)
+VAL_PRED_33<-predict(lm3,newdata=PRED_df_TD)
+VAL_PRED_34<-predict(lm4,newdata=PRED_df_NT)
+VAL_PRED_35<-predict(lm5,newdata=PRED_df_NT_WO)
+VAL_PRED_36<-predict(lm6,newdata=PRED_df_WC)
+VAL_PRED_37<-predict(lm7,newdata=PRED_OED_train_d)
+VAL_PRED_38<-predict(lm8,newdata=PRED_OED_train_d_1)
+VAL_PRED_39<-predict(lm9,newdata=PRED_OED_df_TD)
+VAL_PRED_40<-predict(lm10,newdata=PRED_df_OED)
+VAL_PRED_41<-predict(lm11,newdata=PRED_OED_df_NT_WO)
+VAL_PRED_42<-predict(lm12,newdata=PRED_OED_df_WC)
+VAL_PRED_43<-predict(st1,newdata=PRED_train_d)
+VAL_PRED_44<-predict(st2,newdata=PRED_train_d_1)
+VAL_PRED_45<-predict(st3,newdata=PRED_df_TD)
+VAL_PRED_46<-predict(st4,newdata=PRED_df_NT)
+VAL_PRED_47<-predict(st5,newdata=PRED_df_NT_WO)
+VAL_PRED_48<-predict(st6,newdata=PRED_df_WC)
+VAL_PRED_49<-predict(st7,newdata=PRED_OED_train_d)
+VAL_PRED_50<-predict(st8,newdata=PRED_OED_train_d_1)
+VAL_PRED_51<-predict(st9,newdata=PRED_OED_df_TD)
+VAL_PRED_52<-predict(st10,newdata=PRED_df_OED)
+VAL_PRED_53<-predict(st11,newdata=PRED_OED_df_NT_WO)
+VAL_PRED_54<-predict(st12,newdata=PRED_OED_df_WC)
+VAL_PRED_55<-predict(DS1_RF2,newdata=PRED_df_first_ko_5)
+VAL_PRED_56<-predict(DS1_RF1,newdata=PRED_FT)
+VAL_PRED_57<-predict(OED_NN_M1,newdata=PRED_train_d)
+VAL_PRED_58<-predict(OED_NN_M2,newdata=PRED_train_d_1)
+VAL_PRED_59<-predict(OED_NN_M3,newdata=PRED_df_TD)
+VAL_PRED_60<-predict(OED_NN_PM1,newdata=PRED_train_d)
+VAL_PRED_61<-predict(OED_NN_PM2,newdata=PRED_train_d_1)
+VAL_PRED_62<-predict(OED_NN_PM3,newdata=PRED_df_TD)
+VAL_PRED_63<-predict(OED_GNET_M1,newdata=PRED_train_d)
+VAL_PRED_64<-predict(OED_GNET_M2,newdata=PRED_train_d_1)
+VAL_PRED_65<-predict(OED_GNET_M3,newdata=PRED_df_TD)
+VAL_PRED_66<-predict(OED_GNET_PM1,newdata=PRED_train_d)
+VAL_PRED_67<-predict(OED_GNET_PM2,newdata=PRED_train_d_1)
+VAL_PRED_68<-predict(OED_GNET_PM3,newdata=PRED_df_TD)
+VAL_PRED_69<-predict(OED_EN_M1,newdata=PRED_train_d)
+VAL_PRED_70<-predict(OED_EN_M2,newdata=PRED_train_d_1)
+VAL_PRED_71<-predict(OED_EN_M3,newdata=PRED_df_TD)
+VAL_PRED_72<-predict(OED_EN_PM1,newdata=PRED_train_d)
+VAL_PRED_73<-predict(OED_EN_PM2,newdata=PRED_train_d_1)
+VAL_PRED_74<-predict(OED_EN_PM3,newdata=PRED_df_TD)
+VAL_PRED_75<-predict(OED_RD_M1,newdata=PRED_train_d)
+VAL_PRED_76<-predict(OED_RD_M2,newdata=PRED_train_d_1)
+VAL_PRED_77<-predict(OED_RD_M3,newdata=PRED_df_TD)
+VAL_PRED_78<-predict(OED_RD_PM1,newdata=PRED_train_d)
+VAL_PRED_79<-predict(OED_RD_PM2,newdata=PRED_train_d_1)
+VAL_PRED_80<-predict(OED_RD_PM3,newdata=PRED_df_TD)
+VAL_PRED_81<-predict(OED_RFM1,newdata=PRED_train_d)
+VAL_PRED_82<-predict(OED_RFM2,newdata=PRED_train_d_1)
+VAL_PRED_83<-predict(OED_RFM3,newdata=PRED_df_TD)
+VAL_PRED_84<-predict(OED_RFPM1,newdata=PRED_train_d)
+VAL_PRED_85<-predict(OED_RFPM2,newdata=PRED_train_d_1)
+VAL_PRED_86<-predict(OED_RFPM3,newdata=PRED_df_TD)
+
+
+
+
+VAL_PRED_1
+VAL_PRED_2
+VAL_PRED_3
+VAL_PRED_4
+VAL_PRED_5
+VAL_PRED_6
+VAL_PRED_7
+VAL_PRED_8
+VAL_PRED_9
+VAL_PRED_10
+VAL_PRED_11
+VAL_PRED_12
+VAL_PRED_13
+VAL_PRED_14
+VAL_PRED_15
+VAL_PRED_16
+VAL_PRED_17
+VAL_PRED_18
+VAL_PRED_19
+VAL_PRED_20
+VAL_PRED_21
+VAL_PRED_22
+VAL_PRED_23
+VAL_PRED_24
+VAL_PRED_25
+VAL_PRED_26
+VAL_PRED_27
+VAL_PRED_28
+VAL_PRED_29
+VAL_PRED_30
+VAL_PRED_31
+VAL_PRED_32
+VAL_PRED_33
+VAL_PRED_34
+VAL_PRED_35
+VAL_PRED_36
+VAL_PRED_37
+VAL_PRED_38
+VAL_PRED_39
+VAL_PRED_40
+VAL_PRED_41
+VAL_PRED_42
+VAL_PRED_43
+VAL_PRED_44
+VAL_PRED_45
+VAL_PRED_46
+VAL_PRED_47
+VAL_PRED_48
+VAL_PRED_49
+VAL_PRED_50
+VAL_PRED_51
+VAL_PRED_52
+VAL_PRED_53
+VAL_PRED_54
+VAL_PRED_55
+VAL_PRED_56
+VAL_PRED_57
+VAL_PRED_58
+VAL_PRED_59
+VAL_PRED_60
+VAL_PRED_61
+VAL_PRED_62
+VAL_PRED_63
+VAL_PRED_64
+VAL_PRED_65
+VAL_PRED_66
+VAL_PRED_67
+VAL_PRED_68
+VAL_PRED_69
+VAL_PRED_70
+VAL_PRED_71
+VAL_PRED_72
+VAL_PRED_73
+VAL_PRED_74
+VAL_PRED_75
+VAL_PRED_76
+VAL_PRED_77
+VAL_PRED_78
+VAL_PRED_79
+VAL_PRED_80
+VAL_PRED_81
+VAL_PRED_82
+VAL_PRED_83
+VAL_PRED_84
+VAL_PRED_85
+VAL_PRED_86
+
+
+```
+
+
