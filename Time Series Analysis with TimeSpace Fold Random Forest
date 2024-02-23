@@ -1,0 +1,333 @@
+#Time Series Analysis:
+  #Read in libraries:
+library(here)
+library(ggplot2)
+library(gganimate)
+library(udpipe)
+library(randomForest)
+library(tidyverse)
+library(lme4)
+library(factoextra)
+library(moments)
+library(forecast)
+library(fastDummies)
+library(NeuralNetTools)
+library(caret)
+library(CAST)
+library(parallel)
+library(doMC)
+library(tfruns)
+
+
+#Read all files into this RMD file:
+df_tracking_1 <- read_csv(here("tracking2018.csv"))
+df_tracking_2 <-read_csv(here("tracking2019.csv"))
+df_tracking_3 <-read_csv(here("tracking2020.csv"))
+df_plays <- read_csv(here("plays.csv"))
+df_PFFScouting <-  read_csv(here("PFFScoutingData.csv"))
+df_games <- read.csv(here("games.csv"))
+
+#Combining tracking data sets:-
+df_t <- rbind(df_tracking_2,df_tracking_3)
+
+#Standardizing tracking data so its always in direction of kicking team.
+df_tracking <- df_t %>%
+                mutate(x = ifelse(playDirection == "left", 120-x, x),
+                       y = ifelse(playDirection == "left", 160/3 - y, y))
+
+
+#First Data set attempt was at Euclidean distances from every player ranked by distance from the KR and team was One-Hot Encoded
+#creating data frame that will only includes Kick Returns that were actually returned. 
+df_K <- df_tracking %>%
+  
+    #joining the scouting data
+    left_join(df_plays, by = c("gameId", "playId")) %>%
+  
+    #filtering for kickoff plays only
+    filter(specialTeamsPlayType == "Kickoff") %>%
+  
+  #filtering for only kicks that were returned
+  filter(kickReturnYardage != "NA") %>%
+  
+  #Subsetting desireable variables
+  select(., time:playDirection, possessionTeam:kickBlockerId,kickReturnYardage) %>% 
+  
+  #Creating Unique Indefintifer based off nflId, gameId, and playId
+  mutate(UKI = unique_identifier(., fields = c("nflId", "gameId","playId"))) %>% 
+  
+  #Create Unique Identifier for each unique play across all games and seasons
+  mutate(UPI = unique_identifier(., fields = c("gameId","playId"))) %>%
+  
+  #Joining with PFF scouting data table
+  left_join(df_PFFScouting) %>%
+  
+  #joining data with games data set
+  inner_join(df_games)  %>% 
+
+  #Sorting teams by home and away for each game into one column
+  mutate(Teams = ifelse(team=="home",homeTeamAbbr,visitorTeamAbbr)) %>% 
+  
+  #Sorting by which team is the Kicking and Receiving team for each game 
+  mutate(RecTeam = if_else(possessionTeam==Teams,"Kick","Rec")) %>% 
+
+  #Creating a new variable where I change a categorical level of the position variable to differentiate the kick returner from the rest (The "A" prefix was added to be able to run code later that matches the positioning of the variable)
+  group_by(UPI,frameId) %>%  mutate(a_pos = replace(position,nflId==returnerId,"AKR")) 
+
+
+#Arranging the data by the new position variable, so kick returner is at the top 
+df_KOP <- df_K %>% arrange(.,a_pos) %>% 
+  
+  #Subsetting the data to the moment the Kick Returner receives the kick
+ filter(., event == "kickoff")   %>% 
+  
+  #Subset to only include the Kicking Team
+  filter(.,RecTeam == "Kick") %>% 
+  
+  #Creating categorical variable to differentiate between Kicker and non-kicker
+  mutate(KickerYN = ifelse(nflId==kickerId,"A","B")) %>% 
+  
+  #Cleaning up errors in the data to ensure only players in KickerYN level A , is a kicker
+  filter(., returnerId != "NA") %>%
+  
+  #Arrange with the kickers at the top
+  arrange(., KickerYN) %>% 
+  
+  #Reset group and filter at the point of the kickoff and subset by each unique play 
+   group_by(UPI) %>% 
+  
+  #Creating a variable to find the distance from the kicker
+  mutate(DistKick = y - first(y)) %>%  
+  
+  #ungrouping the data and filter to delete the football out of the data 
+  ungroup () %>% filter(., displayName != "football") %>%
+  
+  #Arrange by the Distance Kick
+  arrange(DistKick) %>% 
+  
+  #Group by each play each unique play 
+  group_by(UPI)  %>%  
+  
+  #Ranking by each distance for each play to determine the position from the kicker, setting up KOP (KOP = Kickoff position)
+  mutate(KOP = rank(DistKick)) %>% 
+  
+  #Recoding the factors to match the position on the kickoff 
+  mutate(KOP = as.factor(KOP), KOP = fct_recode(KOP, "L1" ="1", "L2"="2","L3"="3","L4"="4","L5"="5", "K"="6","R5"="7","R4"="8","R3"="9","R2"="10","R1"="11")) 
+
+#Selecting the unique identifier and the Kickoff Position, and ungrouping the data
+df_KOP <- df_KOP %>% select(., UKI, KOP)  %>% ungroup()
+
+
+#Setting up main kickoff tracking dataset 
+# Creating Inital Kickoff Tracking (KOT_I) by joining main tracking and Kickoff Position by unique identifier 
+df_KOT_I <- df_K %>% left_join(df_KOP, by = "UKI") 
+
+#Converting kickoff position to character and replacing NAs with 0s
+df_KOT_I$KOP <- df_KOT_I$KOP %>% as.character() %>% replace_na(0)
+
+#head df_KOT_I
+head(df_KOT_I)
+
+#Creating Main Kickoff tracking data set 
+df_KOT<- df_KOT_I %>% 
+  
+  #Mutating Kickoff Position to add unique level of Kick Returner
+  mutate(KOP = replace(KOP,nflId==returnerId,"KR")) %>%
+  
+  #Filtering out the football from the tracking data and arrange by position 
+  filter(., displayName != "football") %>% arrange(.,a_pos) %>% 
+  
+  #Renaming the key variables that were altered by the table join
+  rename(.,UPI = UPI.x ) %>% 
+  
+  #Then grouping by each unique frame in each unique play
+  group_by(UPI) %>%
+  
+  #Then creating the distance that each player/observation is from the Kick Returner and ungroup
+  mutate(Euclidean = as.matrix(dist(cbind(x, y)))[1, ]) %>% ungroup()
+
+#head of df_KOT
+head(df_KOT)
+
+#Creating cleaning data set to fill in Missing Kick returner position values by proximity to KR
+df_clean <- df_KOT %>%
+  
+  #Filtering for absent Position values
+  filter(., KOP == "0") %>% 
+  
+  #Selecting only variables needed to fill KOP values 
+  select(., x:dir,nflId,frameId:playDirection,kickReturnYardage:a_pos,KOP:Euclidean) %>%
+  
+  #Arrange by the Euclidean values 
+  arrange(Euclidean) %>% 
+  
+  #Group by each play each unique play 
+  group_by(UPI) %>% 
+  
+  #Ranking by each distance for each play to determine the position from the KR
+  mutate(KOP = rank(Euclidean)) %>%
+  
+  #Filtering out plays where data had a typo and didn't follow previous code
+  filter(., KOP < 11) %>% filter(., Euclidean > 0.0) %>%
+  
+  #Selecting Kick Return Euclidean Position and unique Identifier
+  select(., UKI, KOP)
+
+ #print df_clean
+ head(df_clean)
+
+#Creating Merge data set to combine all values of Kickoff Position into one column 
+df_KRKO <- df_KOT %>% left_join(df_clean, by="UKI") %>% 
+  
+  #Identifying NAs in original KOP column to show where df_clean$KOP values will go
+  mutate(KOP.x = replace(KOP.x, KOP.x==0, NA)) %>% 
+  
+  #Defining new Total KOP (TKOP), that uses both KOP columns to create the complete column
+  transform(., TKOP = ifelse(!is.na(KOP.x), KOP.x, KOP.y)) %>%
+  
+  #Selecting variables of interest
+  select(., x:event,frameId:playDirection,kickReturnYardage:UPI.x,hangTime:kickoffReturnFormation, Teams:a_pos,Euclidean,TKOP) %>% 
+  
+  #Filter out any plays where TKOP could not be identified
+  filter(., TKOP != "NA") %>% 
+  
+  #Rename variables that were altered by the table join
+  rename(.,UPI = UPI.x ) %>%
+  
+  #filter by unique play and only include plays with correct amount of players 
+  group_by(UPI) %>%
+
+  
+  select(., x:playId, UPI, Euclidean:TKOP )
+
+#Creating AKR set only 
+AKR_S <- df_KRKO %>% filter(TKOP == "KR") %>% filter(., event == "tackle") %>% mutate(KR_X = x) %>% select(.,gameId, playId, frameId, KR_X , UPI) %>% ungroup()
+
+
+#Merge data sets 
+KR_TS <- df_KRKO %>% left_join(AKR_S, by = c("UPI") ) %>% mutate(N_event = ifelse(event=="tackle","tackle","none")) %>% filter(., event=="kick_received") %>% select(., -event) %>% na.exclude() 
+
+a<- KR_TS %>% group_by(UPI) %>%  pivot_wider( id_cols = UPI,names_from = TKOP, values_from = Euclidean, names_prefix = "Euc") %>% select(., UPI:EucK) %>% na.exclude()
+
+b<- KR_TS %>% pivot_wider( id_cols = UPI,names_from = TKOP, values_from = x, names_prefix = "x") %>% select(., UPI:xK) %>% na.exclude()
+
+c<- KR_TS %>% pivot_wider( id_cols = UPI,names_from = TKOP, values_from = y, names_prefix = "y") %>% select(., UPI:yK) %>% na.exclude()
+
+d<- KR_TS %>% pivot_wider( id_cols = UPI,names_from = TKOP, values_from = s, names_prefix = "s") %>% select(., UPI:sK) %>% na.exclude()
+
+e<- KR_TS %>% pivot_wider( id_cols = UPI,names_from = TKOP, values_from = a, names_prefix = "a") %>% select(., UPI:aK) %>% na.exclude()
+
+f<- KR_TS %>% pivot_wider( id_cols = UPI,names_from = TKOP, values_from = o, names_prefix = "o") %>% select(., UPI:oK) %>% na.exclude()
+
+g<- KR_TS %>% pivot_wider( id_cols = UPI,names_from = TKOP, values_from = dir, names_prefix = "dir") %>% select(., UPI:dirK) %>% na.exclude()
+
+FKR_TS <- KR_TS %>% left_join(a)%>% left_join(b)%>% left_join(c)%>% left_join(d)%>% left_join(e)%>% left_join(f)%>% left_join(g) %>% select(., -(x:dir), -frameId.y, -Euclidean, -N_event) %>% filter(., TKOP == "L4") %>% na.exclude()
+
+
+KR_TS$TKOP <- as.factor(KR_TS$TKOP)
+
+# Setting up data
+#Multicore processing
+numCores <- detectCores()
+registerDoMC(cores = numCores)
+
+#A function that creates a variable importance score
+I_SCORE_FUNC <- function(RF_TEST){
+i_scores <- varImp(RF_TEST ,conditional=TRUE)
+#Gathering rownames in 'var'  and converting it to the factor
+#to provide 'fill' parameter for the bar chart. 
+i_scores <- i_scores %>% tibble::rownames_to_column("var") 
+i_scores$var<- i_scores$var %>% as.factor()
+#Plotting the bar and polar charts for comparing variables
+i_bar <- ggplot(data = i_scores) + 
+  geom_bar(
+    stat = "identity",#it leaves the data without count and bin
+    mapping = aes(x = var, y=Overall, fill = var), 
+    show.legend = FALSE,
+    width = 1
+  ) + 
+  labs(x = NULL, y = NULL)
+i_bar + coord_polar() + theme_minimal()
+i_bar + coord_flip() + theme_minimal()
+}
+
+
+
+predictors <- c("x","y","s","a","o","dir","Euclidean","TKOP")
+
+set.seed(10)
+model_1 <- train(KR_TS[,predictors],KR_TS$KR_X,
+               method="rf",tuneGrid=data.frame("mtry"=2),
+               importance=TRUE,ntree=50,
+               trControl=trainControl(method="cv",number=3))
+
+
+model_1
+
+I_SCORE_FUNC(model_1$finalModel)
+
+set.seed(10)
+indices <- CreateSpacetimeFolds(KR_TS,spacevar = "TKOP",
+                                k=3)
+
+predictors_1 <- c("x","y","s","a","o","dir","Euclidean")
+
+set.seed(10)
+model_LLO <- train(KR_TS[,predictors_1],KR_TS$KR_X,
+                   method="rf",tuneGrid=data.frame("mtry"=2), importance=TRUE, preProcess = c("center", "scale"), trControl=trainControl(method="cv",index = indices$index))
+
+model_LLO
+
+
+I_SCORE_FUNC(model_LLO$finalModel)
+
+#set.seed(10)
+#ffsmodel_LLO <- ffs(KR_TS[,predictors],KR_TS$KR_X,metric="Rsquared",
+                  #  method="rf", tuneGrid=data.frame("mtry"=2),
+                   # verbose=FALSE,ntree=50,importance = TRUE,
+                    #trControl=trainControl(method="cv",
+                      #                     index = indices$index))
+
+#I_SCORE_FUNC(ffsmodel_LLO$finalModel)
+#plot_ffs(ffsmodel_LLO)
+
+#ffsmodel_LLO_1 <- ffs(KR_TS[,predictors],KR_TS$KR_X,metric="Rsquared",
+                    #method="rf", tuneGrid=data.frame("mtry"=3),
+                    #verbose=FALSE,ntree=50,importance = TRUE,
+                    #trControl=trainControl(method="cv",
+                                          # index = indices$index))
+#I_SCORE_FUNC(ffsmodel_LLO_1)
+#plot_ffs(ffsmodel_LLO_1$finalModel)
+
+#ffsmodel_LLO_2 <- ffs(KR_TS[,predictors],KR_TS$KR_X,metric="Rsquared",
+                  # method="rf", tuneGrid=data.frame("mtry"=2),
+                   # verbose=FALSE,ntree=200,importance = TRUE,
+                    #trControl=trainControl(method="cv",
+                                         # index = indices$index))
+#I_SCORE_FUNC(ffsmodel_LLO_2$finalModel)
+#plot_ffs(ffsmodel_LLO_2)
+
+
+#Results:
+Random Forest with name = "Model LLO"
+
+35576 samples
+    7 predictor
+
+Pre-processing: centered (7), scaled (7) 
+Resampling: Cross-Validated (10 fold) 
+Summary of sample sizes: 24252, 22675, 24225 
+Resampling results:
+
+  RMSE      Rsquared   MAE     
+  5.896435  0.5290068  3.050775
+
+Tuning parameter 'mtry' was held constant at a value of 2
+
+Order of factor importance:
+1. x coordinate of Individual
+2. y coordinate of Individual
+3. Euclidean Distance from Returner
+4. Orientation of Individual
+5. Acceleration of Individual
+6. Direction of Individual
+7. Speed of Individual
