@@ -1,0 +1,33 @@
+{
+  "input_files_detected": [
+    "PFFScoutingData.csv",
+    "games.csv",
+    "plays.csv",
+    "tracking2018.csv",
+    "tracking2019.csv",
+    "tracking2020.csv"
+  ],
+  "complete_manifest": false,
+  "note": "Static extraction of literal reads; dynamic files and schemas require source recovery. Do not redistribute restricted data.",
+  "r_packages_detected": [
+    "CAST",
+    "NeuralNetTools",
+    "caret",
+    "doMC",
+    "elasticnet",
+    "factoextra",
+    "fastDummies",
+    "forecast",
+    "gganimate",
+    "ggplot2",
+    "glmnet",
+    "here",
+    "lme4",
+    "moments",
+    "parallel",
+    "randomForest",
+    "tfruns",
+    "tidyverse",
+    "udpipe"
+  ]
+}

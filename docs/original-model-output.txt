@@ -1,0 +1,23 @@
+Random Forest with name = "Model LLO"
+
+35576 samples
+    7 predictor
+
+Pre-processing: centered (7), scaled (7) 
+Resampling: Cross-Validated (10 fold) 
+Summary of sample sizes: 24252, 22675, 24225 
+Resampling results:
+
+  RMSE      Rsquared   MAE     
+  5.896435  0.5290068  3.050775
+
+Tuning parameter 'mtry' was held constant at a value of 2
+
+Order of factor importance:
+1. x coordinate of Individual
+2. y coordinate of Individual
+3. Euclidean Distance from Returner
+4. Orientation of Individual
+5. Acceleration of Individual
+6. Direction of Individual
+7. Speed of Individual
