@@ -8,7 +8,7 @@ How much information about a kick return is already visible at reception? Distin
 
 ## Data and methodology
 
-Original files remain the source of historical methodology. `data/requirements.json` inventories detected input filenames and packages; it is an incomplete static manifest, not a locked environment. Raw files are absent from this repository. Reacquire them through their original authorized sources; competition and third-party licenses must be checked before reuse.
+Original files remain the source of historical methodology. `data/requirements.json` inventories detected input filenames and packages; it is an incomplete static manifest, not a locked environment. Raw files are absent from this repository; authorized local source recovery is now in progress. Reacquire them through their original authorized sources; competition and third-party licenses must be checked before reuse.
 
 ## Audit and implemented changes
 
@@ -46,3 +46,9 @@ Historical model not re-run. Test fixtures validate logic only. Missing licensed
 ## Next work
 
 Recover input data with provenance and variable timing; declare the observational unit; isolate complete games/matches chronologically; fit transformations on training folds; compare against a simple baseline; regenerate figures and revise findings from held-out evidence. Retain old conclusions as historical until then.
+
+## Executed local historical extension
+
+`scripts/evaluate_local_2018.py` streams authorized local 2018 tracking data, calls the tested identity-anchored R feature helper, trains on Weeks 1–12 and evaluates only Weeks 13–17. It compares a training-mean baseline, linear regression and a fixed random forest. It records source hashes, eligibility/coverage, held-out metrics and complete-game bootstrap ranges. The full pipeline was executed after local source recovery. Results remain in the private owner review package; they are a new one-season return-yardage extension and do not re-estimate the archived terminal-position metric.
+
+Run with `BDB_DATA_DIR=/path/to/authorized/2018/data RESEARCH_OUTPUT_DIR=/private/output python scripts/evaluate_local_2018.py`. Python dependencies are pinned in `requirements-reconstruction.txt`; Rscript and the base-R helper are also required. No source dataset or empirical result is committed to this public branch.

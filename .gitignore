@@ -3,3 +3,5 @@
 .RData
 data/raw/
 .Rproj.user/
+local_results/
+__pycache__/
